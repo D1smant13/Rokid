@@ -1,0 +1,458 @@
+name: V08 Rokid Service Bind Probe APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build V08 APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Generate Android project
+        run: |
+          mkdir -p app/src/main/java/com/damage/rokid/copilot
+          mkdir -p app/src/main/res/values
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+                  maven { url = uri("https://maven.rokid.com/repository/maven-public/") }
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url = uri("https://maven.rokid.com/repository/maven-public/") }
+                  maven { url = uri("https://jitpack.io") }
+              }
+          }
+          rootProject.name = "ConversationCopilotRokid"
+          include ":app"
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id "com.android.application" version "8.6.1" apply false
+          }
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id "com.android.application"
+          }
+
+          android {
+              namespace "com.damage.rokid.copilot"
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId "com.damage.rokid.copilot"
+                  minSdk 28
+                  targetSdk 34
+                  versionCode 8
+                  versionName "0.8-service-bind-probe"
+              }
+          }
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">Conversation Copilot</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+              <style name="Theme.ConversationCopilot" parent="@android:style/Theme.Material.NoActionBar">
+                  <item name="android:windowFullscreen">true</item>
+                  <item name="android:windowNoTitle">true</item>
+                  <item name="android:windowBackground">#000000</item>
+                  <item name="android:fontFamily">sans</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+              <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+              <queries>
+                  <package android:name="com.rokid.cxrservice" />
+                  <package android:name="com.rokid.os.sprite.assistserver" />
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name"
+                  android:theme="@style/Theme.ConversationCopilot"
+                  android:resizeableActivity="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:autoRemoveFromRecents="true"
+                      android:excludeFromRecents="true"
+                      android:screenOrientation="portrait"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|uiMode|density">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/damage/rokid/copilot/MainActivity.java <<'EOF'
+          package com.damage.rokid.copilot;
+
+          import android.app.Activity;
+          import android.content.ComponentName;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.ServiceConnection;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.IBinder;
+          import android.os.Looper;
+          import android.os.RemoteException;
+          import android.view.Gravity;
+          import android.view.KeyEvent;
+          import android.view.MotionEvent;
+          import android.view.Window;
+          import android.view.WindowManager;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+
+          import java.util.ArrayList;
+
+          public class MainActivity extends Activity {
+              private TextView status;
+              private TextView body;
+
+              private final Handler main = new Handler(Looper.getMainLooper());
+              private final ArrayList<String> pages = new ArrayList<>();
+              private int page = 0;
+              private int pending = 0;
+
+              private final Target[] targets = new Target[] {
+                  new Target("CXRService", "com.rokid.cxrservice", "com.rokid.cxrservice.CXRService"),
+                  new Target("MasterAssistService", "com.rokid.os.sprite.assistserver", "com.rokid.os.sprite.assistserver.service.MasterAssistService"),
+                  new Target("SDKService", "com.rokid.os.sprite.assistserver", "com.rokid.os.sprite.assistserver.service.SDKService"),
+                  new Target("SpriteMediaService", "com.rokid.os.sprite.assistserver", "com.rokid.os.sprite.assistserver.service.SpriteMediaService")
+              };
+
+              static class Target {
+                  final String label;
+                  final String pkg;
+                  final String cls;
+
+                  Target(String label, String pkg, String cls) {
+                      this.label = label;
+                      this.pkg = pkg;
+                      this.cls = cls;
+                  }
+              }
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+
+                  requestWindowFeature(Window.FEATURE_NO_TITLE);
+                  getWindow().setFlags(
+                      WindowManager.LayoutParams.FLAG_FULLSCREEN,
+                      WindowManager.LayoutParams.FLAG_FULLSCREEN
+                  );
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
+                  buildUi();
+                  runProbes();
+
+                  Toast.makeText(this, "V08 service bind probe launched", Toast.LENGTH_LONG).show();
+              }
+
+              private void buildUi() {
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setGravity(Gravity.CENTER_HORIZONTAL);
+                  root.setPadding(16, 8, 16, 8);
+                  root.setBackgroundColor(Color.BLACK);
+
+                  TextView title = tv("CONVERSATION COPILOT", 22, "#00FF33", true);
+                  status = tv("V08 SERVICE BIND PROBE", 14, "#FFFFFF", true);
+                  body = tv("Testing explicit service start/bind...", 11, "#DDFFFFFF", false);
+                  TextView footer = tv("Tap/right/vol+ = next • left/vol- = previous", 11, "#CCFFFFFF", false);
+
+                  root.addView(title);
+                  root.addView(status);
+                  root.addView(body);
+                  root.addView(footer);
+
+                  setContentView(root);
+              }
+
+              private TextView tv(String s, int size, String color, boolean bold) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(size);
+                  t.setTextColor(Color.parseColor(color));
+                  t.setGravity(Gravity.CENTER);
+                  t.setPadding(0, 3, 0, 3);
+                  if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
+                  return t;
+              }
+
+              private void runProbes() {
+                  pages.clear();
+                  pages.add(
+                      "V08 SERVICE BIND PROBE\n\n" +
+                      "This tests explicit bind/start against exported Rokid services found in v07.\n\n" +
+                      "Important result: IBinder descriptor.\n\n" +
+                      "Send screenshots of all service pages."
+                  );
+                  show(0);
+
+                  pending = targets.length;
+
+                  for (Target t : targets) {
+                      probeTarget(t);
+                  }
+
+                  main.postDelayed(() -> {
+                      if (pending > 0) {
+                          pages.add("TIMEOUT SUMMARY\nSome probes did not call back within 5 seconds.\nPending=" + pending + "\nThis may mean bind was accepted but service never connected, or the service requires a private permission.");
+                          status.setText("Probe timeout • " + pages.size() + " pages");
+                      }
+                  }, 5000);
+              }
+
+              private void probeTarget(Target t) {
+                  final StringBuilder out = new StringBuilder();
+                  out.append("SERVICE PROBE\n");
+                  out.append(t.label).append("\n");
+                  out.append(t.pkg).append("\n");
+                  out.append(t.cls).append("\n\n");
+
+                  Intent i = new Intent();
+                  i.setComponent(new ComponentName(t.pkg, t.cls));
+
+                  try {
+                      ComponentName started = startService(i);
+                      out.append("startService: ");
+                      out.append(started == null ? "null" : started.flattenToShortString());
+                      out.append("\n");
+
+                      try {
+                          stopService(i);
+                          out.append("stopService: called\n");
+                      } catch (Exception e) {
+                          out.append("stopService: ").append(e.getClass().getSimpleName()).append("\n");
+                      }
+                  } catch (Throwable e) {
+                      out.append("startService ERROR: ").append(e.getClass().getSimpleName()).append("\n");
+                      out.append(cut(safe(e.getMessage()), 220)).append("\n");
+                  }
+
+                  out.append("\n");
+
+                  ServiceConnection conn = new ServiceConnection() {
+                      @Override
+                      public void onServiceConnected(ComponentName name, IBinder service) {
+                          StringBuilder r = new StringBuilder(out.toString());
+
+                          r.append("bindService: CONNECTED\n");
+                          r.append("component: ").append(name == null ? "null" : name.flattenToShortString()).append("\n");
+                          r.append("binderClass: ").append(service == null ? "null" : service.getClass().getName()).append("\n");
+
+                          if (service != null) {
+                              try {
+                                  r.append("descriptor: ").append(safe(service.getInterfaceDescriptor())).append("\n");
+                              } catch (RemoteException e) {
+                                  r.append("descriptor ERROR: RemoteException\n");
+                              } catch (Throwable e) {
+                                  r.append("descriptor ERROR: ").append(e.getClass().getSimpleName()).append("\n");
+                              }
+
+                              try {
+                                  r.append("pingBinder: ").append(service.pingBinder()).append("\n");
+                                  r.append("isBinderAlive: ").append(service.isBinderAlive()).append("\n");
+                              } catch (Throwable e) {
+                                  r.append("binder status ERROR: ").append(e.getClass().getSimpleName()).append("\n");
+                              }
+                          }
+
+                          try {
+                              unbindService(this);
+                              r.append("unbindService: called\n");
+                          } catch (Throwable e) {
+                              r.append("unbindService ERROR: ").append(e.getClass().getSimpleName()).append("\n");
+                          }
+
+                          addPage(r.toString());
+                      }
+
+                      @Override
+                      public void onServiceDisconnected(ComponentName name) {
+                      }
+
+                      @Override
+                      public void onBindingDied(ComponentName name) {
+                          StringBuilder r = new StringBuilder(out.toString());
+                          r.append("bindService: BINDING DIED\n");
+                          r.append("component: ").append(name == null ? "null" : name.flattenToShortString()).append("\n");
+                          addPage(r.toString());
+                      }
+
+                      @Override
+                      public void onNullBinding(ComponentName name) {
+                          StringBuilder r = new StringBuilder(out.toString());
+                          r.append("bindService: NULL BINDING\n");
+                          r.append("component: ").append(name == null ? "null" : name.flattenToShortString()).append("\n");
+                          addPage(r.toString());
+                      }
+                  };
+
+                  try {
+                      boolean ok = bindService(i, conn, Context.BIND_AUTO_CREATE);
+                      out.append("bindService returned: ").append(ok).append("\n");
+
+                      if (!ok) {
+                          addPage(out.toString());
+                      }
+                  } catch (Throwable e) {
+                      out.append("bindService ERROR: ").append(e.getClass().getSimpleName()).append("\n");
+                      out.append(cut(safe(e.getMessage()), 260)).append("\n");
+                      addPage(out.toString());
+                  }
+              }
+
+              private void addPage(String s) {
+                  main.post(() -> {
+                      pending = Math.max(0, pending - 1);
+                      pages.add(cut(s, 1700));
+                      status.setText("Probe results • " + pages.size() + " pages • pending " + pending);
+
+                      if (pages.size() == 2) {
+                          show(1);
+                      }
+                  });
+              }
+
+              private void show(int i) {
+                  if (pages.isEmpty()) return;
+
+                  page = (i + pages.size()) % pages.size();
+                  status.setText("V08 PAGE " + (page + 1) + "/" + pages.size());
+                  body.setText(pages.get(page));
+              }
+
+              private void next() {
+                  show(page + 1);
+              }
+
+              private void prev() {
+                  show(page - 1);
+              }
+
+              private String safe(String s) {
+                  return s == null ? "" : s;
+              }
+
+              private String cut(String s, int n) {
+                  if (s == null) return "";
+                  return s.length() <= n ? s : s.substring(0, n - 12) + "\n...truncated";
+              }
+
+              @Override
+              public boolean onTouchEvent(MotionEvent e) {
+                  if (e.getAction() == MotionEvent.ACTION_UP) {
+                      next();
+                      return true;
+                  }
+
+                  return true;
+              }
+
+              @Override
+              public boolean dispatchKeyEvent(KeyEvent e) {
+                  if (e.getAction() == KeyEvent.ACTION_UP) {
+                      int k = e.getKeyCode();
+
+                      if (k == KeyEvent.KEYCODE_DPAD_RIGHT ||
+                          k == KeyEvent.KEYCODE_VOLUME_UP ||
+                          k == KeyEvent.KEYCODE_ENTER ||
+                          k == KeyEvent.KEYCODE_DPAD_CENTER) {
+                          next();
+                          return true;
+                      }
+
+                      if (k == KeyEvent.KEYCODE_DPAD_LEFT ||
+                          k == KeyEvent.KEYCODE_VOLUME_DOWN) {
+                          prev();
+                          return true;
+                      }
+                  }
+
+                  return super.dispatchKeyEvent(e);
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Show APK output
+        run: |
+          echo "APK output folder:"
+          find app/build/outputs/apk -type f || true
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ConversationCopilot-Rokid-v08-service-bind-probe-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
