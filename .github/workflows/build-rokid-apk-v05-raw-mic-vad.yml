@@ -1,0 +1,514 @@
+name: Build Rokid Conversation Copilot APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Generate Android project
+        run: |
+          mkdir -p app/src/main/java/com/damage/rokid/copilot
+          mkdir -p app/src/main/res/values
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+                  maven { url = uri("https://maven.rokid.com/repository/maven-public/") }
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url = uri("https://maven.rokid.com/repository/maven-public/") }
+                  maven { url = uri("https://jitpack.io") }
+              }
+          }
+          rootProject.name = "ConversationCopilotRokid"
+          include ":app"
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id "com.android.application" version "8.6.1" apply false
+          }
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id "com.android.application"
+          }
+
+          android {
+              namespace "com.damage.rokid.copilot"
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId "com.damage.rokid.copilot"
+                  minSdk 28
+                  targetSdk 34
+                  versionCode 5
+                  versionName "0.5-raw-mic-vad"
+              }
+          }
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">Conversation Copilot</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/values/colors.xml <<'EOF'
+          <resources>
+              <color name="hud_green">#00FF33</color>
+              <color name="hud_white">#FFFFFFFF</color>
+              <color name="hud_dim">#CCFFFFFF</color>
+              <color name="hud_bg">#000000</color>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+              <style name="Theme.ConversationCopilot" parent="@android:style/Theme.Material.NoActionBar">
+                  <item name="android:windowFullscreen">true</item>
+                  <item name="android:windowNoTitle">true</item>
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:colorAccent">@color/hud_green</item>
+                  <item name="android:windowBackground">@color/hud_bg</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+              <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name"
+                  android:theme="@style/Theme.ConversationCopilot"
+                  android:usesCleartextTraffic="true"
+                  android:resizeableActivity="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:autoRemoveFromRecents="true"
+                      android:excludeFromRecents="true"
+                      android:screenOrientation="portrait"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|uiMode|density"
+                      android:theme="@style/Theme.ConversationCopilot">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/damage/rokid/copilot/MainActivity.java <<'EOF'
+          package com.damage.rokid.copilot;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.content.pm.PackageManager;
+          import android.media.AudioFormat;
+          import android.media.AudioRecord;
+          import android.media.MediaRecorder;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.Gravity;
+          import android.view.KeyEvent;
+          import android.view.MotionEvent;
+          import android.view.Window;
+          import android.view.WindowManager;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+
+          public class MainActivity extends Activity {
+              private static final int REQ_AUDIO = 42;
+              private static final int SAMPLE_RATE = 16000;
+              private static final int CHANNEL = AudioFormat.CHANNEL_IN_MONO;
+              private static final int FORMAT = AudioFormat.ENCODING_PCM_16BIT;
+              private static final int FRAME_MS = 60;
+              private static final int SAMPLES_PER_FRAME = SAMPLE_RATE * FRAME_MS / 1000;
+              private static final int BYTES_PER_FRAME = SAMPLES_PER_FRAME * 2;
+
+              private TextView status;
+              private TextView micState;
+              private TextView energyView;
+              private TextView vadView;
+              private TextView fact;
+              private TextView insight;
+              private TextView suggestion;
+
+              private final Handler mainHandler = new Handler(Looper.getMainLooper());
+              private volatile boolean capturing = false;
+              private Thread captureThread;
+              private AudioRecord audioRecord;
+              private long frameCount = 0;
+              private int currentSource = MediaRecorder.AudioSource.MIC;
+              private int voiceFrames = 0;
+              private int silenceFrames = 0;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  requestWindowFeature(Window.FEATURE_NO_TITLE);
+                  getWindow().setFlags(
+                      WindowManager.LayoutParams.FLAG_FULLSCREEN,
+                      WindowManager.LayoutParams.FLAG_FULLSCREEN
+                  );
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
+                  buildHud();
+
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      status.setText("Requesting mic permission...");
+                      requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_AUDIO);
+                  } else {
+                      status.setText("Mic permission granted • tap/select to start raw mic test");
+                  }
+
+                  Toast.makeText(this, "Conversation Copilot v0.5 raw mic test", Toast.LENGTH_LONG).show();
+              }
+
+              private void buildHud() {
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setGravity(Gravity.CENTER_HORIZONTAL);
+                  root.setPadding(22, 12, 22, 12);
+                  root.setBackgroundColor(Color.BLACK);
+
+                  root.addView(tv("CONVERSATION COPILOT", 25, "#00FF33", true));
+                  root.addView(tv("RAW MIC / VAD TEST", 21, "#FFFFFF", true));
+
+                  status = tv("Starting...", 15, "#CCFFFFFF", false);
+                  micState = tv("MIC: idle", 18, "#FFFFFFFF", true);
+                  energyView = tv("ENERGY: --", 20, "#00FF33", true);
+                  vadView = tv("VOICE DETECTION: waiting", 19, "#FFFFFFFF", true);
+
+                  fact = card("FACT CHECK", "No transcript yet. This build only proves raw mic access.");
+                  insight = card("INSIGHT", "If energy changes while people talk, the app can hear conversation audio.");
+                  suggestion = card("NEXT", "Tap/select to start or stop. Speak nearby and watch ENERGY.");
+
+                  root.addView(status);
+                  root.addView(micState);
+                  root.addView(energyView);
+                  root.addView(vadView);
+                  root.addView(fact);
+                  root.addView(insight);
+                  root.addView(suggestion);
+                  root.addView(tv("Silent display only • no read-aloud • no paid API", 14, "#CCFFFFFF", false));
+
+                  setContentView(root);
+              }
+
+              private TextView tv(String text, int sp, String color, boolean bold) {
+                  TextView t = new TextView(this);
+                  t.setText(text);
+                  t.setTextSize(sp);
+                  t.setTextColor(Color.parseColor(color));
+                  t.setGravity(Gravity.CENTER);
+                  t.setPadding(0, 5, 0, 5);
+                  if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
+                  return t;
+              }
+
+              private TextView card(String label, String body) {
+                  TextView t = tv(label + ": " + body, 15, "#DDFFFFFF", false);
+                  t.setGravity(Gravity.CENTER);
+                  t.setPadding(8, 6, 8, 6);
+                  return t;
+              }
+
+              private void toggleCapture() {
+                  if (capturing) {
+                      stopCapture();
+                  } else {
+                      if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                          requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_AUDIO);
+                      } else {
+                          startCapture();
+                      }
+                  }
+              }
+
+              private void startCapture() {
+                  if (capturing) return;
+                  capturing = true;
+                  voiceFrames = 0;
+                  silenceFrames = 0;
+                  frameCount = 0;
+
+                  captureThread = new Thread(() -> {
+                      int minBuffer = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL, FORMAT);
+                      if (minBuffer < BYTES_PER_FRAME) {
+                          minBuffer = BYTES_PER_FRAME * 4;
+                      }
+
+                      int[] sources = new int[] {
+                          MediaRecorder.AudioSource.MIC,
+                          MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                          MediaRecorder.AudioSource.DEFAULT
+                      };
+
+                      AudioRecord record = null;
+                      int usedSource = MediaRecorder.AudioSource.MIC;
+
+                      for (int src : sources) {
+                          try {
+                              AudioRecord candidate = new AudioRecord(
+                                  src,
+                                  SAMPLE_RATE,
+                                  CHANNEL,
+                                  FORMAT,
+                                  minBuffer * 2
+                              );
+                              if (candidate.getState() == AudioRecord.STATE_INITIALIZED) {
+                                  record = candidate;
+                                  usedSource = src;
+                                  break;
+                              } else {
+                                  candidate.release();
+                              }
+                          } catch (Exception ignored) {}
+                      }
+
+                      if (record == null) {
+                          capturing = false;
+                          postUi("AudioRecord failed to initialize", "MIC: failed", "ENERGY: --", "VOICE DETECTION: no mic input");
+                          return;
+                      }
+
+                      audioRecord = record;
+                      currentSource = usedSource;
+
+                      try {
+                          audioRecord.startRecording();
+                      } catch (Exception e) {
+                          capturing = false;
+                          try { audioRecord.release(); } catch (Exception ignored) {}
+                          audioRecord = null;
+                          postUi("startRecording failed: " + e.getClass().getSimpleName(), "MIC: failed", "ENERGY: --", "VOICE DETECTION: start failed");
+                          return;
+                      }
+
+                      postUi("Capturing raw mic • source " + sourceName(currentSource), "MIC: recording", "ENERGY: 0", "VOICE DETECTION: listening");
+
+                      byte[] buffer = new byte[BYTES_PER_FRAME];
+
+                      while (capturing) {
+                          int read = audioRecord.read(buffer, 0, buffer.length);
+                          if (read <= 0) {
+                              continue;
+                          }
+
+                          long energy = computeEnergy(buffer, read);
+                          int peak = computePeak(buffer, read);
+                          boolean voice = energy > 140 || peak > 1200;
+
+                          if (voice) {
+                              voiceFrames++;
+                              silenceFrames = 0;
+                          } else {
+                              silenceFrames++;
+                              if (silenceFrames > 4) voiceFrames = 0;
+                          }
+
+                          frameCount++;
+                          if (frameCount % 3 == 0) {
+                              String vad = voiceFrames >= 2 ? "VOICE DETECTED" : "SILENCE / ROOM";
+                              String factText = voiceFrames >= 2
+                                  ? "Raw mic hears speech. Next step: encode/forward audio."
+                                  : "Waiting for speech above threshold.";
+                              postEnergy(energy, peak, vad, factText);
+                          }
+                      }
+
+                      try { audioRecord.stop(); } catch (Exception ignored) {}
+                      try { audioRecord.release(); } catch (Exception ignored) {}
+                      audioRecord = null;
+                      postUi("Stopped • tap/select to start again", "MIC: stopped", "ENERGY: --", "VOICE DETECTION: stopped");
+                  }, "rokid-raw-mic-capture");
+
+                  captureThread.start();
+              }
+
+              private long computeEnergy(byte[] buffer, int bytesRead) {
+                  long sum = 0;
+                  int samples = bytesRead / 2;
+                  for (int i = 0; i < samples; i++) {
+                      int lo = buffer[i * 2] & 0xFF;
+                      int hi = buffer[i * 2 + 1];
+                      int sample = (hi << 8) | lo;
+                      sum += Math.abs(sample);
+                  }
+                  return samples > 0 ? sum / samples : 0;
+              }
+
+              private int computePeak(byte[] buffer, int bytesRead) {
+                  int peak = 0;
+                  int samples = bytesRead / 2;
+                  for (int i = 0; i < samples; i++) {
+                      int lo = buffer[i * 2] & 0xFF;
+                      int hi = buffer[i * 2 + 1];
+                      int sample = (hi << 8) | lo;
+                      int abs = Math.abs(sample);
+                      if (abs > peak) peak = abs;
+                  }
+                  return peak;
+              }
+
+              private void postEnergy(long energy, int peak, String vad, String factText) {
+                  mainHandler.post(() -> {
+                      status.setText("Capturing raw mic • source " + sourceName(currentSource));
+                      micState.setText("MIC: recording");
+                      energyView.setText("ENERGY: " + energy + "   PEAK: " + peak);
+                      vadView.setText("VOICE DETECTION: " + vad);
+                      fact.setText("FACT CHECK: " + factText);
+                      insight.setText("INSIGHT: AudioRecord is reading live microphone frames.");
+                      suggestion.setText("NEXT: Once stable, connect raw audio to AIUI / assistant bridge.");
+                  });
+              }
+
+              private void postUi(String s, String mic, String energy, String vad) {
+                  mainHandler.post(() -> {
+                      status.setText(s);
+                      micState.setText(mic);
+                      energyView.setText(energy);
+                      vadView.setText(vad);
+                  });
+              }
+
+              private String sourceName(int source) {
+                  if (source == MediaRecorder.AudioSource.MIC) return "MIC";
+                  if (source == MediaRecorder.AudioSource.VOICE_RECOGNITION) return "VOICE_RECOGNITION";
+                  if (source == MediaRecorder.AudioSource.DEFAULT) return "DEFAULT";
+                  return String.valueOf(source);
+              }
+
+              private void stopCapture() {
+                  capturing = false;
+                  try {
+                      if (captureThread != null) captureThread.join(600);
+                  } catch (Exception ignored) {}
+                  captureThread = null;
+              }
+
+              @Override
+              public boolean dispatchKeyEvent(KeyEvent event) {
+                  if (event.getAction() == KeyEvent.ACTION_UP) {
+                      int key = event.getKeyCode();
+                      if (key == KeyEvent.KEYCODE_ENTER ||
+                          key == KeyEvent.KEYCODE_DPAD_CENTER ||
+                          key == KeyEvent.KEYCODE_SPACE ||
+                          key == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE) {
+                          toggleCapture();
+                          return true;
+                      }
+                      if (key == KeyEvent.KEYCODE_BACK) {
+                          if (capturing) {
+                              stopCapture();
+                              return true;
+                          }
+                      }
+                  }
+                  return super.dispatchKeyEvent(event);
+              }
+
+              @Override
+              public boolean onTouchEvent(MotionEvent event) {
+                  if (event.getAction() == MotionEvent.ACTION_UP) {
+                      toggleCapture();
+                      return true;
+                  }
+                  return true;
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (requestCode == REQ_AUDIO) {
+                      if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                          status.setText("Audio permission granted • tap/select to start raw mic");
+                      } else {
+                          status.setText("Audio permission denied");
+                          micState.setText("MIC: permission denied");
+                      }
+                  }
+              }
+
+              @Override
+              protected void onDestroy() {
+                  super.onDestroy();
+                  stopCapture();
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Show APK output
+        run: |
+          echo "APK output folder:"
+          find app/build/outputs/apk -type f || true
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ConversationCopilot-Rokid-v05-raw-mic-vad-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
