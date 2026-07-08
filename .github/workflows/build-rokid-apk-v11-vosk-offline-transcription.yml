@@ -1,0 +1,574 @@
+name: V11 Rokid Vosk Offline Transcription APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build V11 APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Generate Android project with bundled Vosk model
+        run: |
+          set -e
+          mkdir -p app/src/main/java/com/damage/rokid/copilot
+          mkdir -p app/src/main/res/values
+          mkdir -p app/src/main/assets
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "ConversationCopilotRokid"
+          include ":app"
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id "com.android.application" version "8.6.1" apply false
+          }
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id "com.android.application"
+          }
+
+          android {
+              namespace "com.damage.rokid.copilot"
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId "com.damage.rokid.copilot"
+                  minSdk 28
+                  targetSdk 34
+                  versionCode 11
+                  versionName "1.1-vosk-offline-transcription"
+
+                  ndk {
+                      abiFilters "arm64-v8a", "armeabi-v7a"
+                  }
+              }
+
+              aaptOptions {
+                  noCompress "am", "fst", "bin", "txt", "conf", "mdl", "raw", "arpa", "int"
+              }
+          }
+
+          dependencies {
+              implementation "net.java.dev.jna:jna:5.18.1@aar"
+              implementation "com.alphacephei:vosk-android:0.3.75@aar"
+          }
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">Conversation Copilot</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+              <style name="Theme.ConversationCopilot" parent="@android:style/Theme.Material.NoActionBar">
+                  <item name="android:windowFullscreen">true</item>
+                  <item name="android:windowNoTitle">true</item>
+                  <item name="android:windowBackground">#000000</item>
+                  <item name="android:fontFamily">sans</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+              <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name"
+                  android:theme="@style/Theme.ConversationCopilot"
+                  android:resizeableActivity="true"
+                  android:extractNativeLibs="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:autoRemoveFromRecents="true"
+                      android:excludeFromRecents="true"
+                      android:screenOrientation="portrait"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|uiMode|density">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+              </application>
+          </manifest>
+          EOF
+
+          echo "Downloading Vosk small English model..."
+          curl -L --retry 3 -o /tmp/vosk-model-small-en-us-0.15.zip https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+          unzip -q /tmp/vosk-model-small-en-us-0.15.zip -d /tmp/vosk-model
+          mv /tmp/vosk-model/vosk-model-small-en-us-0.15 app/src/main/assets/model-en-us
+
+          cat > app/src/main/java/com/damage/rokid/copilot/MainActivity.java <<'EOF'
+          package com.damage.rokid.copilot;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.content.pm.PackageManager;
+          import android.content.res.AssetManager;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.Gravity;
+          import android.view.KeyEvent;
+          import android.view.MotionEvent;
+          import android.view.Window;
+          import android.view.WindowManager;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+
+          import org.json.JSONObject;
+          import org.vosk.LibVosk;
+          import org.vosk.LogLevel;
+          import org.vosk.Model;
+          import org.vosk.Recognizer;
+          import org.vosk.android.RecognitionListener;
+          import org.vosk.android.SpeechService;
+
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.util.Locale;
+
+          public class MainActivity extends Activity implements RecognitionListener {
+              private static final int REQ_AUDIO = 42;
+              private static final String ASSET_MODEL_DIR = "model-en-us";
+              private static final float SAMPLE_RATE = 16000.0f;
+
+              private TextView status;
+              private TextView transcript;
+              private TextView card;
+              private TextView footer;
+
+              private final Handler ui = new Handler(Looper.getMainLooper());
+
+              private Model model;
+              private SpeechService speechService;
+              private boolean listening = false;
+              private boolean ready = false;
+
+              private String lastPartial = "";
+              private String lastFinal = "";
+              private String transcriptLog = "";
+              private long startedAt = 0L;
+              private int finalCount = 0;
+              private int partialCount = 0;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  requestWindowFeature(Window.FEATURE_NO_TITLE);
+                  getWindow().setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN, WindowManager.LayoutParams.FLAG_FULLSCREEN);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
+                  buildUi();
+                  LibVosk.setLogLevel(LogLevel.WARNINGS);
+
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      status.setText("NEEDS MIC PERMISSION");
+                      requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_AUDIO);
+                  } else {
+                      initModelAsync();
+                  }
+              }
+
+              private void buildUi() {
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setGravity(Gravity.CENTER_HORIZONTAL);
+                  root.setPadding(14, 8, 14, 8);
+                  root.setBackgroundColor(Color.BLACK);
+
+                  TextView title = tv("CONVERSATION COPILOT", 22, "#00FF33", true);
+                  status = tv("V11 OFFLINE TRANSCRIPTION", 14, "#FFFFFF", true);
+                  transcript = tv("Preparing embedded Vosk model...\nFirst launch may take a minute.", 12, "#DDFFFFFF", false);
+                  card = tv("LOCAL BRAIN: waiting for transcript", 12, "#00FF33", true);
+                  footer = tv("Tap/center = start/stop listening • no API • no internet", 11, "#CCFFFFFF", false);
+
+                  root.addView(title);
+                  root.addView(status);
+                  root.addView(transcript);
+                  root.addView(card);
+                  root.addView(footer);
+                  setContentView(root);
+              }
+
+              private TextView tv(String s, int size, String color, boolean bold) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(size);
+                  t.setTextColor(Color.parseColor(color));
+                  t.setGravity(Gravity.CENTER);
+                  t.setPadding(0, 3, 0, 3);
+                  if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
+                  return t;
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (requestCode == REQ_AUDIO && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                      initModelAsync();
+                  } else {
+                      status.setText("MIC PERMISSION DENIED");
+                      transcript.setText("Microphone permission is required for local transcription.");
+                  }
+              }
+
+              private void initModelAsync() {
+                  status.setText("LOADING LOCAL MODEL");
+                  transcript.setText("Copying embedded Vosk model from APK assets...\nThis is offline and local.");
+
+                  new Thread(() -> {
+                      try {
+                          File modelDir = new File(getFilesDir(), "vosk-model-en-us");
+                          File marker = new File(modelDir, ".copilot_model_ready");
+
+                          if (!marker.exists()) {
+                              deleteRecursive(modelDir);
+                              modelDir.mkdirs();
+                              copyAssetDir(getAssets(), ASSET_MODEL_DIR, modelDir);
+                              marker.createNewFile();
+                          }
+
+                          model = new Model(modelDir.getAbsolutePath());
+
+                          ui.post(() -> {
+                              ready = true;
+                              status.setText("MODEL READY");
+                              transcript.setText("Offline transcription ready.\nTap/center to start listening.");
+                              card.setText("LOCAL BRAIN: ready\nSay a few clear sentences.");
+                              startListening();
+                          });
+
+                      } catch (Throwable e) {
+                          ui.post(() -> {
+                              status.setText("MODEL LOAD FAILED");
+                              transcript.setText(e.getClass().getSimpleName() + "\n" + safe(e.getMessage()));
+                              card.setText("Try reinstalling the APK or check storage/RAM.");
+                          });
+                      }
+                  }).start();
+              }
+
+              private void startListening() {
+                  if (!ready || model == null || listening) return;
+
+                  try {
+                      Recognizer rec = new Recognizer(model, SAMPLE_RATE);
+                      speechService = new SpeechService(rec, SAMPLE_RATE);
+                      speechService.startListening(this);
+                      listening = true;
+                      startedAt = System.currentTimeMillis();
+
+                      status.setText("LISTENING OFFLINE");
+                      footer.setText("Tap/center = stop • finals=" + finalCount + " partials=" + partialCount);
+                      card.setText("LOCAL BRAIN: listening\nSpeak normally. Transcription is fully offline.");
+
+                  } catch (Throwable e) {
+                      status.setText("LISTEN FAILED");
+                      transcript.setText(e.getClass().getSimpleName() + "\n" + safe(e.getMessage()));
+                  }
+              }
+
+              private void stopListening() {
+                  if (speechService != null) {
+                      speechService.stop();
+                      speechService.shutdown();
+                      speechService = null;
+                  }
+                  listening = false;
+                  status.setText("STOPPED");
+                  footer.setText("Tap/center = start listening • no API • no internet");
+              }
+
+              private void toggleListening() {
+                  if (!ready) {
+                      Toast.makeText(this, "Model still loading", Toast.LENGTH_SHORT).show();
+                      return;
+                  }
+                  if (listening) stopListening();
+                  else startListening();
+              }
+
+              @Override
+              public void onPartialResult(String hypothesis) {
+                  partialCount++;
+                  String text = extract(hypothesis, "partial");
+                  if (text.length() > 0) lastPartial = text;
+                  updateHud();
+              }
+
+              @Override
+              public void onResult(String hypothesis) {
+                  String text = extract(hypothesis, "text");
+                  if (text.length() > 0) {
+                      finalCount++;
+                      lastFinal = text;
+                      appendTranscript(text);
+                  }
+                  updateHud();
+              }
+
+              @Override
+              public void onFinalResult(String hypothesis) {
+                  String text = extract(hypothesis, "text");
+                  if (text.length() > 0) {
+                      finalCount++;
+                      lastFinal = text;
+                      appendTranscript(text);
+                  }
+                  listening = false;
+                  updateHud();
+              }
+
+              @Override
+              public void onError(Exception e) {
+                  status.setText("VOSK ERROR");
+                  transcript.setText(e.getClass().getSimpleName() + "\n" + safe(e.getMessage()));
+                  card.setText("LOCAL BRAIN: transcription stopped");
+                  listening = false;
+              }
+
+              @Override
+              public void onTimeout() {
+                  status.setText("TIMEOUT");
+                  listening = false;
+                  updateHud();
+              }
+
+              private void appendTranscript(String text) {
+                  if (text == null || text.trim().isEmpty()) return;
+                  transcriptLog = (transcriptLog + "\n" + text.trim()).trim();
+                  if (transcriptLog.length() > 900) {
+                      transcriptLog = transcriptLog.substring(transcriptLog.length() - 900);
+                      int firstBreak = transcriptLog.indexOf('\n');
+                      if (firstBreak > 0) transcriptLog = transcriptLog.substring(firstBreak + 1);
+                  }
+              }
+
+              private void updateHud() {
+                  long seconds = startedAt == 0L ? 0L : (System.currentTimeMillis() - startedAt) / 1000L;
+
+                  String display =
+                      "FINAL TRANSCRIPT:\n" +
+                      (transcriptLog.length() == 0 ? "(waiting for final words)" : transcriptLog) +
+                      "\n\nLIVE PARTIAL:\n" +
+                      (lastPartial.length() == 0 ? "(listening...)" : lastPartial);
+
+                  transcript.setText(display);
+                  footer.setText("offline vosk • " + seconds + "s • finals=" + finalCount + " partials=" + partialCount);
+                  card.setText(makeLocalBrainCard());
+              }
+
+              private String makeLocalBrainCard() {
+                  String text = (transcriptLog + " " + lastPartial).trim().toLowerCase(Locale.US);
+
+                  if (text.length() < 8) {
+                      return "LOCAL BRAIN\nNeed more words before suggestions.";
+                  }
+
+                  if (containsAny(text, "price", "cost", "money", "dollar", "percent", "rate", "number")) {
+                      return "FACT CHECK\nA number/money claim was detected.\nAsk: “What is that based on?”";
+                  }
+
+                  if (containsAny(text, "always", "never", "everyone", "nobody", "guaranteed")) {
+                      return "INSIGHT\nAbsolute claim detected.\nAsk for an example or exception.";
+                  }
+
+                  if (containsAny(text, "deadline", "tomorrow", "today", "date", "schedule", "meeting")) {
+                      return "NEXT STEP\nTime/date claim detected.\nConfirm the exact deadline.";
+                  }
+
+                  if (containsAny(text, "i think", "maybe", "probably", "not sure")) {
+                      return "COACH\nUncertainty detected.\nAsk a clarifying follow-up.";
+                  }
+
+                  if (text.length() > 160) {
+                      return "SUMMARY PROMPT\nLong point detected.\nSay: “Let me make sure I understood that.”";
+                  }
+
+                  return "SUGGESTED NEXT\nAsk one clarifying question before agreeing.";
+              }
+
+              private boolean containsAny(String text, String... words) {
+                  for (String w : words) {
+                      if (text.contains(w)) return true;
+                  }
+                  return false;
+              }
+
+              private String extract(String json, String key) {
+                  try {
+                      JSONObject obj = new JSONObject(json == null ? "{}" : json);
+                      String value = obj.optString(key, "");
+                      return value == null ? "" : value.trim();
+                  } catch (Throwable ignored) {
+                      return "";
+                  }
+              }
+
+              private void copyAssetDir(AssetManager am, String assetPath, File destDir) throws Exception {
+                  String[] items = am.list(assetPath);
+                  if (items == null || items.length == 0) {
+                      copyAssetFile(am, assetPath, destDir);
+                      return;
+                  }
+
+                  if (!destDir.exists()) destDir.mkdirs();
+
+                  for (String item : items) {
+                      String childAssetPath = assetPath + "/" + item;
+                      File childDest = new File(destDir, item);
+                      String[] childItems = am.list(childAssetPath);
+                      if (childItems != null && childItems.length > 0) {
+                          copyAssetDir(am, childAssetPath, childDest);
+                      } else {
+                          copyAssetFile(am, childAssetPath, childDest);
+                      }
+                  }
+              }
+
+              private void copyAssetFile(AssetManager am, String assetPath, File destFile) throws Exception {
+                  File parent = destFile.getParentFile();
+                  if (parent != null && !parent.exists()) parent.mkdirs();
+
+                  try (InputStream in = am.open(assetPath);
+                       OutputStream out = new FileOutputStream(destFile)) {
+                      byte[] buf = new byte[8192];
+                      int len;
+                      while ((len = in.read(buf)) > 0) {
+                          out.write(buf, 0, len);
+                      }
+                  }
+              }
+
+              private void deleteRecursive(File f) {
+                  if (f == null || !f.exists()) return;
+                  if (f.isDirectory()) {
+                      File[] kids = f.listFiles();
+                      if (kids != null) {
+                          for (File k : kids) deleteRecursive(k);
+                      }
+                  }
+                  f.delete();
+              }
+
+              private String safe(String s) {
+                  return s == null ? "" : s;
+              }
+
+              @Override
+              public boolean onTouchEvent(MotionEvent e) {
+                  if (e.getAction() == MotionEvent.ACTION_UP) {
+                      toggleListening();
+                      return true;
+                  }
+                  return true;
+              }
+
+              @Override
+              public boolean dispatchKeyEvent(KeyEvent e) {
+                  if (e.getAction() == KeyEvent.ACTION_UP) {
+                      int k = e.getKeyCode();
+                      if (k == KeyEvent.KEYCODE_ENTER ||
+                          k == KeyEvent.KEYCODE_DPAD_CENTER ||
+                          k == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ||
+                          k == KeyEvent.KEYCODE_VOLUME_UP ||
+                          k == KeyEvent.KEYCODE_VOLUME_DOWN) {
+                          toggleListening();
+                          return true;
+                      }
+                  }
+                  return super.dispatchKeyEvent(e);
+              }
+
+              @Override
+              protected void onDestroy() {
+                  super.onDestroy();
+                  if (speechService != null) {
+                      speechService.stop();
+                      speechService.shutdown();
+                      speechService = null;
+                  }
+                  if (model != null) {
+                      model.close();
+                      model = null;
+                  }
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Show APK output and size
+        run: |
+          echo "APK output folder:"
+          find app/build/outputs/apk -type f -exec ls -lh {} \;
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ConversationCopilot-Rokid-v11-vosk-offline-transcription-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
