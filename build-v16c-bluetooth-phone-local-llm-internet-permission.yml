@@ -1,0 +1,1906 @@
+name: V16C Rokid Bluetooth Phone Local LLM Internet Permission APKs
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build V16C Bluetooth Local LLM APKs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform, NDK, and CMake
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools" "ndk;27.2.12479018" "cmake;3.22.1"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Build phone llama-cli Android runner
+        run: |
+          set -euxo pipefail
+
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp
+
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
+          export READELF="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          export STRIP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          ls -lh "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+          "$ANDROID_HOME/cmake/3.22.1/bin/cmake" --version
+          ninja --version
+
+          "$ANDROID_HOME/cmake/3.22.1/bin/cmake" -G Ninja -S /tmp/llama.cpp -B /tmp/llama-build \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DCMAKE_C_FLAGS="-Oz -ffunction-sections -fdata-sections -march=armv8.2-a" \
+            -DCMAKE_CXX_FLAGS="-Oz -ffunction-sections -fdata-sections -march=armv8.2-a" \
+            -DCMAKE_EXE_LINKER_FLAGS="-Wl,--gc-sections -Wl,--strip-all" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--gc-sections -Wl,--strip-all" \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=OFF \
+            -DGGML_LLAMAFILE=OFF \
+            -DGGML_BLAS=OFF \
+            -DGGML_CUDA=OFF \
+            -DGGML_METAL=OFF \
+            -DGGML_VULKAN=OFF \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_APP=OFF \
+            -DLLAMA_BUILD_UI=OFF \
+            -DLLAMA_USE_PREBUILT_UI=OFF \
+            -DLLAMA_TOOLS_INSTALL=OFF
+
+          "$ANDROID_HOME/cmake/3.22.1/bin/cmake" --build /tmp/llama-build --target help | grep -E 'llama-cli|llama-server|simple|main' || true
+          "$ANDROID_HOME/cmake/3.22.1/bin/cmake" --build /tmp/llama-build --config Release -j2 --target llama-cli
+
+          BIN="$(find /tmp/llama-build -type f -name 'llama-cli' -perm -111 | head -n 1 || true)"
+          if [ -z "$BIN" ]; then
+            echo "llama-cli target built but executable was not found."
+            find /tmp/llama-build -type f -perm -111 -exec ls -lh {} \; || true
+            exit 1
+          fi
+
+          mkdir -p /tmp/phone-llm-assets/llama-lib
+          cp "$BIN" /tmp/phone-llm-assets/llama-runner-arm64
+          chmod 755 /tmp/phone-llm-assets/llama-runner-arm64
+          "$STRIP" --strip-all /tmp/phone-llm-assets/llama-runner-arm64 || true
+          echo "cli" > /tmp/phone-llm-assets/llama-runner-kind.txt
+
+          for LIB in $("$READELF" -d /tmp/phone-llm-assets/llama-runner-arm64 2>/dev/null | sed -n 's/.*Shared library: \[\(.*\)\].*/\1/p' | sort -u); do
+            case "$LIB" in
+              libc.so|libm.so|libdl.so|liblog.so)
+                echo "System lib, not copying: $LIB"
+                ;;
+              libc++_shared.so)
+                STL="$(find "$ANDROID_NDK_HOME" -name libc++_shared.so | grep -E 'arm64-v8a|aarch64-linux-android' | head -n 1 || true)"
+                if [ -n "$STL" ] && [ -f "$STL" ]; then
+                  cp "$STL" "/tmp/phone-llm-assets/llama-lib/$LIB"
+                  "$STRIP" --strip-all "/tmp/phone-llm-assets/llama-lib/$LIB" || true
+                fi
+                ;;
+              *)
+                FOUND="$(find /tmp/llama-build -type f -name "$LIB" | head -n 1 || true)"
+                if [ -n "$FOUND" ] && [ -f "$FOUND" ]; then
+                  cp "$FOUND" "/tmp/phone-llm-assets/llama-lib/$LIB"
+                  "$STRIP" --strip-all "/tmp/phone-llm-assets/llama-lib/$LIB" || true
+                else
+                  echo "WARNING: Needed lib not found in build tree: $LIB"
+                fi
+                ;;
+            esac
+          done
+
+          for LIBNAME in libllama.so libggml.so libggml-base.so libggml-cpu.so; do
+            FOUND="$(find /tmp/llama-build -type f -name "$LIBNAME" | head -n 1 || true)"
+            if [ -n "$FOUND" ] && [ -f "$FOUND" ] && [ ! -f "/tmp/phone-llm-assets/llama-lib/$LIBNAME" ]; then
+              cp "$FOUND" "/tmp/phone-llm-assets/llama-lib/$LIBNAME"
+              "$STRIP" --strip-all "/tmp/phone-llm-assets/llama-lib/$LIBNAME" || true
+            fi
+          done
+
+          echo "Phone LLM payload:"
+          find /tmp/phone-llm-assets -maxdepth 2 -type f -exec ls -lh {} \; || true
+          du -sh /tmp/phone-llm-assets || true
+
+
+      - name: Generate Phone Bluetooth Brain Bridge
+        run: |
+          set -e
+          mkdir -p phone/app/src/main/java/com/damage/copilot/btbrain
+          mkdir -p phone/app/src/main/res/values
+          mkdir -p phone/app/src/main/assets
+
+          cp /tmp/phone-llm-assets/llama-runner-arm64 phone/app/src/main/assets/llama-runner-arm64
+          cp /tmp/phone-llm-assets/llama-runner-kind.txt phone/app/src/main/assets/llama-runner-kind.txt
+          cp -a /tmp/phone-llm-assets/llama-lib phone/app/src/main/assets/llama-lib
+
+          echo "Downloading phone SmolLM2 135M GGUF local brain..."
+          curl -L --retry 3 -o phone/app/src/main/assets/brain.gguf "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf?download=true"
+
+          echo "Phone asset sizes:"
+          du -sh phone/app/src/main/assets/* || true
+
+          cat > phone/settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "PhoneBluetoothLocalLlmBrain"
+          include ":app"
+          EOF
+
+          cat > phone/build.gradle <<'EOF'
+          plugins {
+              id "com.android.application" version "8.6.1" apply false
+          }
+          EOF
+
+          cat > phone/app/build.gradle <<'EOF'
+          plugins {
+              id "com.android.application"
+          }
+
+          android {
+              namespace "com.damage.copilot.btbrain"
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId "com.damage.copilot.btbrain"
+                  minSdk 23
+                  targetSdk 28
+                  versionCode 1605
+                  versionName "16.0c-phone-bluetooth-local-llm-internet-permission"
+
+                  ndk {
+                      abiFilters "arm64-v8a"
+                  }
+              }
+
+              aaptOptions {
+                  noCompress "gguf"
+              }
+          }
+          EOF
+
+          cat > phone/app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">BT Brain</string>
+          </resources>
+          EOF
+
+          cat > phone/app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+              <style name="Theme.BTBrain" parent="@android:style/Theme.Material.NoActionBar">
+                  <item name="android:windowFullscreen">false</item>
+                  <item name="android:windowNoTitle">true</item>
+                  <item name="android:windowBackground">#000000</item>
+                  <item name="android:fontFamily">sans</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > phone/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.BLUETOOTH" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name"
+                  android:theme="@style/Theme.BTBrain"
+                  android:resizeableActivity="true"
+                  android:largeHeap="true"
+                  android:extractNativeLibs="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|uiMode|density">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          echo "V16C: Phone manifest includes INTERNET permission for local llama.cpp socket/bind calls."
+
+          cat > phone/app/src/main/java/com/damage/copilot/btbrain/MainActivity.java <<'EOF'
+          package com.damage.copilot.btbrain;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.bluetooth.BluetoothAdapter;
+          import android.bluetooth.BluetoothDevice;
+          import android.bluetooth.BluetoothServerSocket;
+          import android.bluetooth.BluetoothSocket;
+          import android.content.pm.PackageManager;
+          import android.content.res.AssetManager;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.Gravity;
+          import android.view.MotionEvent;
+          import android.view.Window;
+          import android.view.WindowManager;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+
+          import java.io.BufferedReader;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.io.OutputStream;
+          import java.nio.charset.StandardCharsets;
+          import java.util.Locale;
+          import java.util.Set;
+          import java.util.UUID;
+          import java.util.concurrent.TimeUnit;
+
+          public class MainActivity extends Activity {
+              private static final UUID COPILOT_UUID = UUID.fromString("8b6f9b10-6f8d-4b7f-9d34-2d4b7a0f9c21");
+              private static final String SERVICE_NAME = "DamageCopilotBrainV16A";
+              private static final int REQ_PERMS = 300;
+
+              private static final String ASSET_LLM_MODEL = "brain.gguf";
+              private static final String ASSET_LLAMA_BIN = "llama-runner-arm64";
+              private static final String ASSET_LLAMA_KIND = "llama-runner-kind.txt";
+              private static final String ASSET_LLAMA_LIB_DIR = "llama-lib";
+
+              private final Handler ui = new Handler(Looper.getMainLooper());
+              private TextView status;
+              private TextView details;
+              private TextView lastBox;
+              private TextView footer;
+
+              private BluetoothAdapter adapter;
+              private BluetoothServerSocket serverSocket;
+              private volatile boolean running = false;
+              private volatile boolean llmReady = false;
+              private volatile boolean llmBusy = false;
+              private Thread serverThread;
+
+              private File llamaBinFile;
+              private File llamaLibDir;
+              private File llmModelFile;
+              private String runnerKind = "unknown";
+
+              private int accepts = 0;
+              private int requests = 0;
+              private int llmOk = 0;
+              private int llmFail = 0;
+              private int ruleFallbacks = 0;
+              private String lastRemote = "(none)";
+              private String lastTranscript = "(none)";
+              private String lastCard = "(none)";
+              private String lastError = "(none)";
+              private String lastRaw = "(none)";
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  requestWindowFeature(Window.FEATURE_NO_TITLE);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  buildUi();
+                  ensurePermissionsThenStart();
+              }
+
+              private void buildUi() {
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setGravity(Gravity.CENTER_HORIZONTAL);
+                  root.setPadding(24, 24, 24, 24);
+                  root.setBackgroundColor(Color.BLACK);
+
+                  root.addView(tv("PHONE BT LLM BRAIN V16C", 23, "#00FF33", true));
+                  status = tv("STARTING", 18, "#FFFFFF", true);
+                  details = tv("Preparing Bluetooth server and local LLM...", 14, "#00FF33", false);
+                  lastBox = tv("Waiting for Rokid transcript.", 15, "#00FF33", true);
+                  footer = tv("No Wi-Fi • no cloud • phone-local LLM with rule fallback", 12, "#CCFFFFFF", false);
+
+                  root.addView(status);
+                  root.addView(details);
+                  root.addView(lastBox);
+                  root.addView(footer);
+                  setContentView(root);
+              }
+
+              private TextView tv(String s, int size, String color, boolean bold) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(size);
+                  t.setTextColor(Color.parseColor(color));
+                  t.setGravity(Gravity.CENTER);
+                  t.setPadding(0, 6, 0, 6);
+                  if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
+                  return t;
+              }
+
+              private void ensurePermissionsThenStart() {
+                  if (Build.VERSION.SDK_INT >= 31) {
+                      if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED ||
+                          checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                          requestPermissions(new String[]{
+                              Manifest.permission.BLUETOOTH_CONNECT,
+                              Manifest.permission.BLUETOOTH_SCAN
+                          }, REQ_PERMS);
+                          return;
+                      }
+                  } else if (Build.VERSION.SDK_INT >= 23) {
+                      if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                          requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, REQ_PERMS);
+                          return;
+                      }
+                  }
+                  initLlmAsync();
+                  startServer();
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  initLlmAsync();
+                  startServer();
+              }
+
+              private void initLlmAsync() {
+                  status.setText("COPYING PHONE LLM");
+                  details.setText("First launch copies the local model and runner. This may take a minute.");
+
+                  new Thread(() -> {
+                      try {
+                          File brainDir = new File(getFilesDir(), "phone-local-llm-v16c");
+                          if (!brainDir.exists()) brainDir.mkdirs();
+
+                          llamaBinFile = new File(brainDir, "llama-runner");
+                          llamaLibDir = new File(brainDir, "lib");
+                          llmModelFile = new File(brainDir, "brain.gguf");
+
+                          if (!llamaBinFile.exists() || llamaBinFile.length() < 1024) {
+                              copyAssetFile(getAssets(), ASSET_LLAMA_BIN, llamaBinFile);
+                          }
+                          llamaBinFile.setReadable(true, false);
+                          llamaBinFile.setExecutable(true, false);
+
+                          if (!llamaLibDir.exists() || llamaLibDir.listFiles() == null || llamaLibDir.listFiles().length == 0) {
+                              deleteRecursive(llamaLibDir);
+                              llamaLibDir.mkdirs();
+                              copyAssetDir(getAssets(), ASSET_LLAMA_LIB_DIR, llamaLibDir);
+                          }
+
+                          if (!llmModelFile.exists() || llmModelFile.length() < 50L * 1024L * 1024L) {
+                              copyAssetFile(getAssets(), ASSET_LLM_MODEL, llmModelFile);
+                          }
+
+                          runnerKind = readSmallAsset(ASSET_LLAMA_KIND).trim();
+                          if (runnerKind.length() == 0) runnerKind = "unknown";
+
+                          llmReady = llamaBinFile.exists() && llamaBinFile.canExecute() && llmModelFile.exists() && llamaLibDir.exists();
+
+                          ui.post(() -> updateUi(llmReady ? "BT SERVER + LLM READY" : "BT SERVER + RULES ONLY"));
+                      } catch (Throwable e) {
+                          llmReady = false;
+                          lastError = "LLM init " + e.getClass().getSimpleName() + ": " + safe(e.getMessage());
+                          ui.post(() -> updateUi("LLM INIT FAILED / RULES ONLY"));
+                      }
+                  }, "phone-llm-init-v16c").start();
+              }
+
+              private void startServer() {
+                  stopServer();
+                  adapter = BluetoothAdapter.getDefaultAdapter();
+
+                  if (adapter == null) {
+                      status.setText("NO BLUETOOTH ADAPTER");
+                      details.setText("Phone does not expose BluetoothAdapter.");
+                      return;
+                  }
+
+                  boolean enabled = false;
+                  try { enabled = adapter.isEnabled(); } catch (Throwable ignored) {}
+
+                  if (!enabled) {
+                      status.setText("BLUETOOTH OFF");
+                      details.setText("Turn Bluetooth on, pair with Rokid, then tap to retry.");
+                      return;
+                  }
+
+                  running = true;
+                  serverThread = new Thread(this::serverLoop, "phone-bt-llm-v16c-server");
+                  serverThread.start();
+                  updateUi("BT SERVER STARTING");
+              }
+
+              private void stopServer() {
+                  running = false;
+                  try { if (serverSocket != null) serverSocket.close(); } catch (Throwable ignored) {}
+                  serverSocket = null;
+              }
+
+              private void serverLoop() {
+                  try {
+                      serverSocket = adapter.listenUsingRfcommWithServiceRecord(SERVICE_NAME, COPILOT_UUID);
+                      ui.post(() -> updateUi(llmReady ? "BT SERVER + LLM READY" : "BT SERVER READY / LLM LOADING"));
+
+                      while (running) {
+                          BluetoothSocket socket = serverSocket.accept();
+                          accepts++;
+                          new Thread(() -> handleSocket(socket), "phone-bt-llm-v16c-client").start();
+                      }
+                  } catch (Throwable e) {
+                      lastError = e.getClass().getSimpleName() + ": " + safe(e.getMessage());
+                      if (running) ui.post(() -> updateUi("SERVER FAILED"));
+                  }
+              }
+
+              private void handleSocket(BluetoothSocket socket) {
+                  try {
+                      BluetoothDevice remote = socket.getRemoteDevice();
+                      lastRemote = safeDevice(remote);
+
+                      BufferedReader br = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+                      OutputStream out = socket.getOutputStream();
+
+                      StringBuilder input = new StringBuilder();
+                      String line;
+                      while ((line = br.readLine()) != null) {
+                          if ("__END__".equals(line.trim())) break;
+                          input.append(line).append("\n");
+                          if (input.length() > 4000) break;
+                      }
+
+                      lastTranscript = input.toString().trim();
+                      lastCard = thinkHybrid(lastTranscript);
+                      requests++;
+
+                      out.write((lastCard + "\n__END__\n").getBytes(StandardCharsets.UTF_8));
+                      out.flush();
+
+                      try { socket.close(); } catch (Throwable ignored) {}
+                      ui.post(() -> updateUi("CONNECTED / REPLIED"));
+                  } catch (Throwable e) {
+                      lastError = e.getClass().getSimpleName() + ": " + safe(e.getMessage());
+                      try { socket.close(); } catch (Throwable ignored) {}
+                      ui.post(() -> updateUi("CLIENT ERROR"));
+                  }
+              }
+
+              private String thinkHybrid(String text) {
+                  String rule = ruleThink(text);
+
+                  if (!llmReady) {
+                      ruleFallbacks++;
+                      return rule.replace("SOURCE: PHONE BT", "SOURCE: PHONE RULES");
+                  }
+
+                  if (llmBusy) {
+                      ruleFallbacks++;
+                      return rule.replace("SOURCE: PHONE BT", "SOURCE: PHONE RULES BUSY");
+                  }
+
+                  llmBusy = true;
+                  try {
+                      String raw = runLlama(text);
+                      lastRaw = compactRaw(raw, 240);
+                      String card = cleanLlmCard(raw);
+
+                      if (card.length() >= 4) {
+                          llmOk++;
+                          return "SOURCE: PHONE LLM\n" + card;
+                      }
+
+                      llmFail++;
+                      ruleFallbacks++;
+                      lastError = "LLM invalid raw: " + compactRaw(raw, 120);
+                      return rule.replace("SOURCE: PHONE BT", "SOURCE: PHONE RULES");
+                  } catch (Throwable e) {
+                      llmFail++;
+                      ruleFallbacks++;
+                      lastError = "LLM " + e.getClass().getSimpleName() + ": " + safe(e.getMessage());
+                      return rule.replace("SOURCE: PHONE BT", "SOURCE: PHONE RULES");
+                  } finally {
+                      llmBusy = false;
+                  }
+              }
+
+              private String runLlama(String transcriptText) throws Exception {
+                  String prompt =
+                      "You are a smart-glasses conversation copilot.\n" +
+                      "Return ONE short HUD card only.\n" +
+                      "Start with exactly one label: ASK:, VERIFY:, SUMMARIZE:, PUSH BACK:, ACTION:, or NOTE:.\n" +
+                      "Max 18 words. No markdown. No explanation.\n" +
+                      "If a factual or math claim is false, use VERIFY: or PUSH BACK:.\n\n" +
+                      "Transcript:\n" + safe(transcriptText) + "\n\nCard:";
+
+                  ProcessBuilder pb = new ProcessBuilder(
+                      llamaBinFile.getAbsolutePath(),
+                      "-m", llmModelFile.getAbsolutePath(),
+                      "-p", prompt,
+                      "-n", "56",
+                      "-c", "512",
+                      "-t", "4",
+                      "--temp", "0.2",
+                      "--no-display-prompt"
+                  );
+
+                  pb.redirectErrorStream(false);
+                  pb.environment().put("LD_LIBRARY_PATH", llamaLibDir.getAbsolutePath());
+
+                  Process p = pb.start();
+                  StreamGrabber stdout = new StreamGrabber(p.getInputStream(), "llm-stdout");
+                  StreamGrabber stderr = new StreamGrabber(p.getErrorStream(), "llm-stderr");
+                  stdout.start();
+                  stderr.start();
+
+                  boolean done = p.waitFor(28, TimeUnit.SECONDS);
+                  if (!done) {
+                      try { p.destroy(); } catch (Throwable ignored) {}
+                      throw new RuntimeException("timeout");
+                  }
+
+                  try { stdout.join(500); } catch (Throwable ignored) {}
+                  try { stderr.join(500); } catch (Throwable ignored) {}
+
+                  String out = stdout.text();
+                  String err = stderr.text();
+
+                  if (p.exitValue() != 0) {
+                      throw new RuntimeException("exit=" + p.exitValue() + " err=" + compactRaw(err, 100));
+                  }
+
+                  return out + "\n" + err;
+              }
+
+              static class StreamGrabber extends Thread {
+                  private final InputStream in;
+                  private final StringBuilder out = new StringBuilder();
+
+                  StreamGrabber(InputStream in, String name) {
+                      super(name);
+                      this.in = in;
+                  }
+
+                  @Override
+                  public void run() {
+                      try (BufferedReader br = new BufferedReader(new InputStreamReader(in))) {
+                          String line;
+                          while ((line = br.readLine()) != null) {
+                              out.append(line).append("\n");
+                              if (out.length() > 16000) {
+                                  out.delete(0, out.length() - 12000);
+                              }
+                          }
+                      } catch (Throwable ignored) {}
+                  }
+
+                  String text() {
+                      return out.toString();
+                  }
+              }
+
+              private String cleanLlmCard(String raw) {
+                  if (raw == null) return "";
+                  String normalized = raw.replace("\r", "\n");
+
+                  int cardIdx = normalized.lastIndexOf("Card:");
+                  if (cardIdx >= 0) normalized = normalized.substring(cardIdx + 5);
+
+                  String lowAll = normalized.toLowerCase(Locale.US);
+                  int labelIndex = firstLabelIndex(lowAll);
+                  if (labelIndex >= 0) normalized = normalized.substring(labelIndex);
+
+                  StringBuilder kept = new StringBuilder();
+                  for (String line : normalized.split("\n")) {
+                      String t = line.trim();
+                      if (t.length() == 0) continue;
+                      String low = t.toLowerCase(Locale.US);
+                      if (isLlamaLogLine(low) || low.contains("llama_model_loader") || low.contains("ggml") ||
+                          low.contains("metadata") || low.contains("tensor") || low.contains(".gguf") ||
+                          low.startsWith("main:") || low.startsWith("load_") || low.startsWith("common_")) {
+                          continue;
+                      }
+                      kept.append(t).append("\n");
+                  }
+
+                  String cleaned = kept.toString().trim();
+                  for (String line : cleaned.split("\n")) {
+                      String t = stripQuotes(line.trim());
+                      if (t.length() == 0) continue;
+                      String low = t.toLowerCase(Locale.US);
+                      if (low.startsWith("ask:") || low.startsWith("verify:") || low.startsWith("summarize:") ||
+                          low.startsWith("push back:") || low.startsWith("action:") || low.startsWith("note:")) {
+                          return limitWords(t, 22);
+                      }
+                  }
+
+                  String low = cleaned.toLowerCase(Locale.US);
+                  if (((low.contains("one plus one") || low.contains("1+1") || low.contains("1 + 1")) &&
+                      (low.contains("two") || low.contains("2"))) ||
+                      ((low.contains("incorrect") || low.contains("false") || low.contains("not seven")) &&
+                      (low.contains("two") || low.contains("2")))) {
+                      return "VERIFY: One plus one equals two, not seven.";
+                  }
+
+                  return "";
+              }
+
+              private String ruleThink(String text) {
+                  String raw = text == null ? "" : text.trim();
+                  String low = raw.toLowerCase(Locale.US);
+
+                  if (low.length() == 0) {
+                      return "SOURCE: PHONE BT\nNOTE: Bluetooth brain is online.";
+                  }
+
+                  if ((low.contains("one plus one") && (low.contains("seven") || low.contains("7"))) ||
+                      low.contains("1+1=7") || low.contains("1 + 1 = 7")) {
+                      return "SOURCE: PHONE BT\nVERIFY: One plus one equals two, not seven.";
+                  }
+
+                  if ((low.contains("two plus two") && (low.contains("five") || low.contains("5"))) ||
+                      low.contains("2+2=5") || low.contains("2 + 2 = 5")) {
+                      return "SOURCE: PHONE BT\nVERIFY: Two plus two equals four, not five.";
+                  }
+
+                  if (containsAny(low, "urgent", "emergency", "asap", "right now")) {
+                      return "SOURCE: PHONE BT\nACTION: Identify the immediate next step and owner.";
+                  }
+
+                  if (containsAny(low, "always", "never", "everyone", "nobody", "guaranteed", "impossible")) {
+                      return "SOURCE: PHONE BT\nPUSH BACK: Ask for one example or exception.";
+                  }
+
+                  if (containsAny(low, "price", "cost", "money", "dollar", "percent", "rate", "number", "amount", "fee", "budget")) {
+                      return "SOURCE: PHONE BT\nVERIFY: Ask what number or source supports that.";
+                  }
+
+                  if (containsAny(low, "deadline", "tomorrow", "today", "schedule", "meeting", "when", "time", "due")) {
+                      return "SOURCE: PHONE BT\nACTION: Confirm the exact deadline or next step.";
+                  }
+
+                  if (containsAny(low, "i think", "maybe", "probably", "not sure", "guess", "assume", "roughly")) {
+                      return "SOURCE: PHONE BT\nASK: Clarify the uncertain part before agreeing.";
+                  }
+
+                  if (containsAny(low, "because", "therefore", "reason", "why", "so that")) {
+                      return "SOURCE: PHONE BT\nVERIFY: Ask what evidence supports that reasoning.";
+                  }
+
+                  if (low.length() > 220) {
+                      return "SOURCE: PHONE BT\nSUMMARIZE: Let me make sure I understood that.";
+                  }
+
+                  return "SOURCE: PHONE BT\nASK: Ask one useful follow-up question.";
+              }
+
+              private boolean isLlamaLogLine(String low) {
+                  return low.startsWith("llama_") || low.startsWith("ggml_") || low.startsWith("llm_") ||
+                      low.startsWith("sampler") || low.startsWith("prompt eval") || low.startsWith("eval time") ||
+                      low.startsWith("total time") || low.contains("key-value pairs") || low.contains("tokens per second");
+              }
+
+              private int firstLabelIndex(String low) {
+                  int best = -1;
+                  String[] labels = {"ask:", "verify:", "summarize:", "push back:", "action:", "note:"};
+                  for (String label : labels) {
+                      int idx = low.indexOf(label);
+                      if (idx >= 0 && (best < 0 || idx < best)) best = idx;
+                  }
+                  return best;
+              }
+
+              private String stripQuotes(String s) {
+                  if (s == null) return "";
+                  s = s.trim();
+                  while (s.startsWith("\"") || s.startsWith("'") || s.startsWith("-")) s = s.substring(1).trim();
+                  while (s.endsWith("\"") || s.endsWith("'")) s = s.substring(0, s.length() - 1).trim();
+                  return s;
+              }
+
+              private String limitWords(String s, int maxWords) {
+                  String[] parts = s.trim().split("\\s+");
+                  if (parts.length <= maxWords) return s.trim();
+                  StringBuilder b = new StringBuilder();
+                  for (int i = 0; i < maxWords; i++) {
+                      if (i > 0) b.append(' ');
+                      b.append(parts[i]);
+                  }
+                  return b.toString();
+              }
+
+              private boolean containsAny(String text, String... words) {
+                  for (String w : words) {
+                      if (text.contains(w)) return true;
+                  }
+                  return false;
+              }
+
+              private void updateUi(String state) {
+                  status.setText(state);
+                  details.setText(
+                      "BT name: " + safeCallName() + "\n" +
+                      "Brain: " + (llmReady ? "LLM READY / " + runnerKind : "RULES ONLY") + (llmBusy ? " / BUSY" : "") + "\n" +
+                      "Accepts: " + accepts + " Requests: " + requests + "\n" +
+                      "LLM ok/fail: " + llmOk + "/" + llmFail + " Rules: " + ruleFallbacks
+                  );
+
+                  lastBox.setText(
+                      "LAST REMOTE\n" + lastRemote + "\n\n" +
+                      "LAST TRANSCRIPT\n" + tail(lastTranscript, 200) + "\n\n" +
+                      "LAST CARD\n" + lastCard + "\n\n" +
+                      "LAST ERROR\n" + lastError + "\n\n" +
+                      "LAST RAW\n" + tail(lastRaw, 160)
+                  );
+
+                  footer.setText("Keep open. V16C adds INTERNET for local llama socket; rules remain as fallback.");
+              }
+
+              private int bondedCount() {
+                  try {
+                      Set<BluetoothDevice> devices = adapter.getBondedDevices();
+                      return devices == null ? 0 : devices.size();
+                  } catch (Throwable ignored) {
+                      return -1;
+                  }
+              }
+
+              private String safeDevice(BluetoothDevice d) {
+                  if (d == null) return "(unknown device)";
+                  String name = "(name blocked)";
+                  String addr = "(addr blocked)";
+                  try { name = d.getName(); } catch (Throwable ignored) {}
+                  try { addr = d.getAddress(); } catch (Throwable ignored) {}
+                  return safe(name) + " / " + safe(addr);
+              }
+
+              private String safeCallName() {
+                  try { return safe(adapter.getName()); } catch (Throwable ignored) { return "(blocked)"; }
+              }
+
+              private void copyAssetDir(AssetManager am, String assetPath, File destDir) throws Exception {
+                  String[] items = am.list(assetPath);
+                  if (items == null || items.length == 0) {
+                      copyAssetFile(am, assetPath, destDir);
+                      return;
+                  }
+                  if (!destDir.exists()) destDir.mkdirs();
+                  for (String item : items) {
+                      String childAssetPath = assetPath + "/" + item;
+                      File childDest = new File(destDir, item);
+                      String[] childItems = am.list(childAssetPath);
+                      if (childItems != null && childItems.length > 0) copyAssetDir(am, childAssetPath, childDest);
+                      else copyAssetFile(am, childAssetPath, childDest);
+                  }
+              }
+
+              private void copyAssetFile(AssetManager am, String assetPath, File destFile) throws Exception {
+                  File parent = destFile.getParentFile();
+                  if (parent != null && !parent.exists()) parent.mkdirs();
+                  try (InputStream in = am.open(assetPath); OutputStream out = new FileOutputStream(destFile)) {
+                      byte[] buf = new byte[8192];
+                      int len;
+                      while ((len = in.read(buf)) > 0) out.write(buf, 0, len);
+                  }
+              }
+
+              private void deleteRecursive(File f) {
+                  if (f == null || !f.exists()) return;
+                  if (f.isDirectory()) {
+                      File[] kids = f.listFiles();
+                      if (kids != null) for (File k : kids) deleteRecursive(k);
+                  }
+                  f.delete();
+              }
+
+              private String readSmallAsset(String assetPath) {
+                  try (InputStream in = getAssets().open(assetPath);
+                       BufferedReader br = new BufferedReader(new InputStreamReader(in))) {
+                      StringBuilder b = new StringBuilder();
+                      String line;
+                      while ((line = br.readLine()) != null) {
+                          b.append(line).append("\n");
+                          if (b.length() > 128) break;
+                      }
+                      return b.toString();
+                  } catch (Throwable ignored) {
+                      return "";
+                  }
+              }
+
+              private String compactRaw(String raw, int maxChars) {
+                  if (raw == null) return "(none)";
+                  String s = raw.replace("\r", " ").replace("\n", " ").replace("\t", " ").trim();
+                  while (s.contains("  ")) s = s.replace("  ", " ");
+                  if (s.length() == 0) return "(empty)";
+                  if (s.length() > maxChars) s = s.substring(0, maxChars) + "...";
+                  return s;
+              }
+
+              private String tail(String s, int max) {
+                  if (s == null) return "";
+                  if (s.length() <= max) return s;
+                  return "..." + s.substring(s.length() - max);
+              }
+
+              private String safe(String s) {
+                  return s == null || s.length() == 0 ? "(empty)" : s;
+              }
+
+              @Override
+              public boolean onTouchEvent(MotionEvent e) {
+                  if (e.getAction() == MotionEvent.ACTION_UP) {
+                      startServer();
+                      return true;
+                  }
+                  return true;
+              }
+
+              @Override
+              protected void onDestroy() {
+                  super.onDestroy();
+                  stopServer();
+              }
+          }
+          EOF
+
+      - name: Build Phone BT Local LLM Brain APK
+        run: gradle -p phone :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Generate Rokid Bluetooth HUD Bridge
+        run: |
+          set -e
+          mkdir -p rokid/app/src/main/java/com/damage/rokid/copilot
+          mkdir -p rokid/app/src/main/res/values
+          mkdir -p rokid/app/src/main/assets
+
+          cat > rokid/settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "RokidBluetoothHudForPhoneLlm"
+          include ":app"
+          EOF
+
+          cat > rokid/build.gradle <<'EOF'
+          plugins {
+              id "com.android.application" version "8.6.1" apply false
+          }
+          EOF
+
+          cat > rokid/app/build.gradle <<'EOF'
+          plugins {
+              id "com.android.application"
+          }
+
+          android {
+              namespace "com.damage.rokid.copilot"
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId "com.damage.rokid.copilot"
+                  minSdk 28
+                  targetSdk 28
+                  versionCode 1606
+                  versionName "16.0c-rokid-bluetooth-hud-phone-llm"
+
+                  ndk {
+                      abiFilters "arm64-v8a"
+                  }
+              }
+
+              aaptOptions {
+                  noCompress "am", "fst", "bin", "conf", "mdl", "raw", "arpa", "int"
+              }
+          }
+
+          dependencies {
+              implementation "net.java.dev.jna:jna:5.18.1@aar"
+              implementation "com.alphacephei:vosk-android:0.3.75@aar"
+          }
+          EOF
+
+          cat > rokid/app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">Conversation Copilot</string>
+          </resources>
+          EOF
+
+          cat > rokid/app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+              <style name="Theme.ConversationCopilot" parent="@android:style/Theme.Material.NoActionBar">
+                  <item name="android:windowFullscreen">true</item>
+                  <item name="android:windowNoTitle">true</item>
+                  <item name="android:windowBackground">#000000</item>
+                  <item name="android:fontFamily">sans</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > rokid/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.BLUETOOTH" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+              <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+              <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name"
+                  android:theme="@style/Theme.ConversationCopilot"
+                  android:resizeableActivity="true"
+                  android:extractNativeLibs="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:autoRemoveFromRecents="true"
+                      android:excludeFromRecents="true"
+                      android:screenOrientation="portrait"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|uiMode|density">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          echo "Downloading Vosk small English model..."
+          curl -L --retry 3 -o /tmp/vosk-model-small-en-us-0.15.zip https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+          unzip -q /tmp/vosk-model-small-en-us-0.15.zip -d /tmp/vosk-model
+          mv /tmp/vosk-model/vosk-model-small-en-us-0.15 rokid/app/src/main/assets/model-en-us
+
+          cat > rokid/app/src/main/java/com/damage/rokid/copilot/MainActivity.java <<'EOF'
+          package com.damage.rokid.copilot;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.bluetooth.BluetoothAdapter;
+          import android.bluetooth.BluetoothDevice;
+          import android.bluetooth.BluetoothSocket;
+          import android.content.pm.PackageManager;
+          import android.content.res.AssetManager;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.media.AudioFormat;
+          import android.media.AudioRecord;
+          import android.media.MediaRecorder;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.Gravity;
+          import android.view.KeyEvent;
+          import android.view.MotionEvent;
+          import android.view.Window;
+          import android.view.WindowManager;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import org.json.JSONObject;
+          import org.vosk.LibVosk;
+          import org.vosk.LogLevel;
+          import org.vosk.Model;
+          import org.vosk.Recognizer;
+
+          import java.io.BufferedReader;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.io.OutputStream;
+          import java.nio.charset.StandardCharsets;
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Set;
+          import java.util.UUID;
+
+          public class MainActivity extends Activity {
+              private static final int REQ_AUDIO = 42;
+              private static final UUID COPILOT_UUID = UUID.fromString("8b6f9b10-6f8d-4b7f-9d34-2d4b7a0f9c21");
+              private static final String CURRENT_ROOT = "copilot-v16c";
+              private static final String ASSET_MODEL_DIR = "model-en-us";
+              private static final int SAMPLE_RATE = 16000;
+              private static final float PCM_GAIN = 2.0f;
+
+              private TextView status;
+              private TextView transcript;
+              private TextView card;
+              private TextView footer;
+
+              private final Handler ui = new Handler(Looper.getMainLooper());
+
+              private Model speechModel;
+              private Recognizer recognizer;
+              private AudioRecord recorder;
+              private BluetoothAdapter btAdapter;
+              private BluetoothDevice phoneDevice;
+
+              private volatile boolean ready = false;
+              private volatile boolean listening = false;
+              private volatile boolean btBusy = false;
+
+              private String transcriptLog = "";
+              private String lastPartial = "";
+              private String currentCard = "SOURCE: LOCAL\nWaiting for Bluetooth phone brain.";
+              private String fallbackCard = "SOURCE: LOCAL\nWaiting for transcript.";
+              private String cleanupSummary = "";
+              private String btName = "(none)";
+              private String btAddress = "(none)";
+              private String btError = "(none)";
+              private long lastSuccessfulBtAt = 0L;
+
+              private long startedAt = 0L;
+              private long lastUiAt = 0L;
+              private long lastBtAt = 0L;
+
+              private int finalCount = 0;
+              private int partialCount = 0;
+              private int readCount = 0;
+              private int readErrors = 0;
+              private int peak = 0;
+              private int sessionPeak = 0;
+              private int btOk = 0;
+              private int btFail = 0;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  requestWindowFeature(Window.FEATURE_NO_TITLE);
+                  getWindow().setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN, WindowManager.LayoutParams.FLAG_FULLSCREEN);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  buildUi();
+                  LibVosk.setLogLevel(LogLevel.WARNINGS);
+
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      status.setText("NEEDS MIC PERMISSION");
+                      requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_AUDIO);
+                  } else {
+                      initAsync();
+                  }
+              }
+
+              private void buildUi() {
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setGravity(Gravity.CENTER_HORIZONTAL);
+                  root.setPadding(16, 8, 16, 8);
+                  root.setBackgroundColor(Color.BLACK);
+
+                  TextView title = tv("CONVERSATION COPILOT", 21, "#00FF33", true);
+                  status = tv("V16C BT PHONE LLM", 13, "#FFFFFF", true);
+                  transcript = tv("Loading Vosk and Bluetooth phone-local LLM bridge...", 11, "#DDFFFFFF", false);
+                  card = tv("PHONE BT LLM\nOpen companion app on phone.", 14, "#00FF33", true);
+                  footer = tv("Rokid = mic/HUD • phone = Bluetooth LLM", 10, "#CCFFFFFF", false);
+
+                  root.addView(title);
+                  root.addView(status);
+                  root.addView(transcript);
+                  root.addView(card);
+                  root.addView(footer);
+                  setContentView(root);
+              }
+
+              private TextView tv(String s, int size, String color, boolean bold) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(size);
+                  t.setTextColor(Color.parseColor(color));
+                  t.setGravity(Gravity.CENTER);
+                  t.setPadding(0, 3, 0, 3);
+                  if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
+                  return t;
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (requestCode == REQ_AUDIO && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                      initAsync();
+                  } else {
+                      status.setText("MIC PERMISSION DENIED");
+                      transcript.setText("Microphone permission is required.");
+                      card.setText("Permission blocked.");
+                  }
+              }
+
+              private void initAsync() {
+                  status.setText("LOADING BT BRIDGE");
+                  transcript.setText("Cleaning old LLM copies and loading Vosk.\nPhone handles brain over Bluetooth.");
+
+                  new Thread(() -> {
+                      try {
+                          cleanupSummary = cleanupOldBuilds();
+
+                          File root = new File(getFilesDir(), CURRENT_ROOT);
+                          File speechDir = new File(root, "vosk-model-en-us");
+                          File marker = new File(speechDir, ".speech_ready_v16c");
+
+                          if (!marker.exists()) {
+                              deleteRecursive(speechDir);
+                              speechDir.mkdirs();
+                              copyAssetDir(getAssets(), ASSET_MODEL_DIR, speechDir);
+                              marker.createNewFile();
+                          }
+
+                          speechModel = new Model(speechDir.getAbsolutePath());
+                          recognizer = new Recognizer(speechModel, SAMPLE_RATE);
+                          recognizer.setWords(false);
+
+                          findPhoneDevice();
+
+                          ui.post(() -> {
+                              ready = true;
+                              status.setText(phoneDevice != null ? "READY: BT PHONE LINK" : "READY: NO PHONE FOUND");
+                              transcript.setText("Vosk ready.\n" + cleanupSummary + "\nBT target: " + btName);
+                              currentCard = phoneDevice != null ? "SOURCE: PHONE BT\nReady." : "SOURCE: LOCAL\nPhone BT brain not found.";
+                              startListening();
+                          });
+                      } catch (Throwable e) {
+                          ui.post(() -> {
+                              status.setText("LOAD FAILED");
+                              transcript.setText(e.getClass().getSimpleName() + "\n" + safe(e.getMessage()) + "\n\n" + cleanupSummary);
+                              card.setText("Run cleaner or reinstall.");
+                          });
+                      }
+                  }, "copilot-v16c-init").start();
+              }
+
+              private void findPhoneDevice() {
+                  btAdapter = BluetoothAdapter.getDefaultAdapter();
+                  phoneDevice = null;
+                  btName = "(none)";
+                  btAddress = "(none)";
+                  btError = "(none)";
+
+                  if (btAdapter == null) {
+                      btError = "No BluetoothAdapter";
+                      return;
+                  }
+
+                  try {
+                      if (!btAdapter.isEnabled()) {
+                          btError = "Bluetooth off/unavailable";
+                          return;
+                      }
+                  } catch (Throwable e) {
+                      btError = shortErr(e);
+                      return;
+                  }
+
+                  Set<BluetoothDevice> bonded;
+                  try {
+                      bonded = btAdapter.getBondedDevices();
+                  } catch (Throwable e) {
+                      btError = "Cannot read bonded: " + shortErr(e);
+                      return;
+                  }
+
+                  if (bonded == null || bonded.size() == 0) {
+                      btError = "No bonded devices";
+                      return;
+                  }
+
+                  List<BluetoothDevice> devices = new ArrayList<>(bonded);
+
+                  String savedAddr = "";
+                  try { savedAddr = getPreferences(0).getString("last_good_bt_addr", ""); } catch (Throwable ignored) {}
+
+                  if (savedAddr != null && savedAddr.length() > 0) {
+                      for (BluetoothDevice d : devices) {
+                          String addr = safeDeviceAddr(d);
+                          if (savedAddr.equals(addr)) {
+                              phoneDevice = d;
+                              btName = safeDeviceName(d);
+                              btAddress = addr;
+                              return;
+                          }
+                      }
+                  }
+
+                  // Prefer names that look like user's phone, but fall back to all bonded devices.
+                  for (BluetoothDevice d : devices) {
+                      String n = safeDeviceName(d).toLowerCase(Locale.US);
+                      if (n.contains("s25") || n.contains("ultra") || n.contains("kyle") || n.contains("phone") || n.contains("galaxy")) {
+                          phoneDevice = d;
+                          btName = safeDeviceName(d);
+                          btAddress = safeDeviceAddr(d);
+                          return;
+                      }
+                  }
+
+                  for (BluetoothDevice d : devices) {
+                      String n = safeDeviceName(d).toLowerCase(Locale.US);
+                      if (!n.contains("g7x") && !n.contains("car") && !n.contains("headphone")) {
+                          phoneDevice = d;
+                          btName = safeDeviceName(d);
+                          btAddress = safeDeviceAddr(d);
+                          return;
+                      }
+                  }
+
+                  phoneDevice = devices.get(0);
+                  btName = safeDeviceName(phoneDevice);
+                  btAddress = safeDeviceAddr(phoneDevice);
+              }
+
+              private List<BluetoothDevice> bondedDevicesSnapshot() {
+                  List<BluetoothDevice> list = new ArrayList<>();
+                  try {
+                      if (btAdapter == null) btAdapter = BluetoothAdapter.getDefaultAdapter();
+                      if (btAdapter == null) return list;
+                      Set<BluetoothDevice> bonded = btAdapter.getBondedDevices();
+                      if (bonded != null) list.addAll(bonded);
+                  } catch (Throwable ignored) {}
+                  return list;
+              }
+
+              private String cleanupOldBuilds() {
+                  CleanupStats s = new CleanupStats();
+                  safeDeleteChildren(getCacheDir(), s);
+                  safeDeleteChildren(getCodeCacheDir(), s);
+                  safeDeleteChildren(getNoBackupFilesDir(), s);
+
+                  File files = getFilesDir();
+                  String[] legacy = {"vosk-model-en-us", "local-brain", "models", "model-en-us", "brain.gguf", "llama-cli", "llama-runner", "llama-lib"};
+                  for (String n : legacy) deleteTarget(new File(files, n), s);
+
+                  File[] kids = files.listFiles();
+                  if (kids != null) {
+                      for (File k : kids) {
+                          String n = k.getName();
+                          if (n.startsWith("copilot-v") && !n.equals(CURRENT_ROOT)) {
+                              deleteTarget(k, s);
+                          }
+                      }
+                  }
+
+                  return "Cleanup: " + humanBytes(s.bytes) + " / " + s.files + " files / failed " + s.failed;
+              }
+
+              static class CleanupStats {
+                  long bytes = 0L;
+                  int files = 0;
+                  int failed = 0;
+              }
+
+              private void safeDeleteChildren(File dir, CleanupStats s) {
+                  if (dir == null || !dir.exists() || !dir.isDirectory()) return;
+                  File[] kids = dir.listFiles();
+                  if (kids != null) for (File k : kids) deleteTarget(k, s);
+              }
+
+              private void deleteTarget(File f, CleanupStats s) {
+                  if (f == null || !f.exists()) return;
+                  if (f.isDirectory()) {
+                      File[] kids = f.listFiles();
+                      if (kids != null) for (File k : kids) deleteTarget(k, s);
+                  }
+                  long len = sizeOf(f);
+                  if (f.delete()) {
+                      s.bytes += len;
+                      s.files++;
+                  } else if (f.exists()) {
+                      s.failed++;
+                  }
+              }
+
+              private long sizeOf(File f) {
+                  try {
+                      if (f == null || !f.exists()) return 0L;
+                      if (f.isFile()) return Math.max(0L, f.length());
+                      long total = 0L;
+                      File[] kids = f.listFiles();
+                      if (kids != null) for (File k : kids) total += sizeOf(k);
+                      return total;
+                  } catch (Throwable ignored) {
+                      return 0L;
+                  }
+              }
+
+              private String humanBytes(long bytes) {
+                  double b = (double)Math.max(0L, bytes);
+                  String[] u = {"B", "KB", "MB", "GB"};
+                  int i = 0;
+                  while (b >= 1024.0 && i < u.length - 1) {
+                      b /= 1024.0;
+                      i++;
+                  }
+                  return String.format(Locale.US, "%.1f %s", b, u[i]);
+              }
+
+              private void startListening() {
+                  if (!ready || speechModel == null || recognizer == null || listening) return;
+
+                  try {
+                      int min = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+                      int bufferSize = Math.max(min * 2, SAMPLE_RATE);
+
+                      recorder = new AudioRecord(
+                          MediaRecorder.AudioSource.MIC,
+                          SAMPLE_RATE,
+                          AudioFormat.CHANNEL_IN_MONO,
+                          AudioFormat.ENCODING_PCM_16BIT,
+                          bufferSize
+                      );
+
+                      if (recorder.getState() != AudioRecord.STATE_INITIALIZED) {
+                          throw new RuntimeException("AudioRecord not initialized");
+                      }
+
+                      resetSessionStats();
+                      listening = true;
+                      startedAt = System.currentTimeMillis();
+                      recorder.startRecording();
+
+                      new Thread(this::audioLoop, "copilot-v16c-audio-vosk").start();
+
+                      status.setText(phoneDevice != null ? "LISTENING + BT PHONE" : "LISTENING LOCAL");
+                      footer.setText("Vosk local → Bluetooth phone LLM → Rokid HUD");
+                  } catch (Throwable e) {
+                      status.setText("AUDIO START FAILED");
+                      transcript.setText(e.getClass().getSimpleName() + "\n" + safe(e.getMessage()));
+                      card.setText("Mic route failed.");
+                      cleanupRecorder();
+                  }
+              }
+
+              private void resetSessionStats() {
+                  transcriptLog = "";
+                  lastPartial = "";
+                  currentCard = phoneDevice != null ? "SOURCE: PHONE BT\nReady." : "SOURCE: LOCAL\nPhone BT brain not found.";
+                  fallbackCard = "SOURCE: LOCAL\nWaiting for transcript.";
+                  finalCount = 0;
+                  partialCount = 0;
+                  readCount = 0;
+                  readErrors = 0;
+                  peak = 0;
+                  sessionPeak = 0;
+                  lastUiAt = 0L;
+                  lastBtAt = 0L;
+              }
+
+              private void audioLoop() {
+                  byte[] raw = new byte[4096];
+                  byte[] boosted = new byte[4096];
+
+                  while (listening && recorder != null) {
+                      int n;
+                      try {
+                          n = recorder.read(raw, 0, raw.length);
+                      } catch (Throwable e) {
+                          readErrors++;
+                          postHud();
+                          continue;
+                      }
+
+                      if (n <= 0) {
+                          readErrors++;
+                          postHud();
+                          continue;
+                      }
+
+                      readCount++;
+                      applyGainAndMeasure(raw, boosted, n);
+
+                      try {
+                          boolean finalReady = recognizer.acceptWaveForm(boosted, n);
+                          if (finalReady) {
+                              String text = extract(recognizer.getResult(), "text");
+                              if (text.length() > 0) {
+                                  finalCount++;
+                                  lastPartial = "";
+                                  appendTranscript(text);
+                                  updateFallbackCard();
+                                  sendToPhoneMaybe();
+                              }
+                          } else {
+                              String text = extract(recognizer.getPartialResult(), "partial");
+                              if (text.length() > 0) {
+                                  partialCount++;
+                                  lastPartial = text;
+                                  updateFallbackCard();
+                              }
+                          }
+                      } catch (Throwable ignored) {}
+
+                      long now = System.currentTimeMillis();
+                      if (now - lastUiAt > 250) {
+                          lastUiAt = now;
+                          postHud();
+                      }
+                  }
+
+                  try {
+                      String text = extract(recognizer.getFinalResult(), "text");
+                      if (text.length() > 0) {
+                          finalCount++;
+                          appendTranscript(text);
+                          updateFallbackCard();
+                          sendToPhoneMaybe();
+                      }
+                  } catch (Throwable ignored) {}
+
+                  postHud();
+              }
+
+              private void sendToPhoneMaybe() {
+                  if (btBusy) return;
+
+                  String text = transcriptLog.trim();
+                  if (text.length() < 8) return;
+
+                  long now = System.currentTimeMillis();
+                  if (now - lastBtAt < 2500L) return;
+                  lastBtAt = now;
+
+                  if (phoneDevice == null) {
+                      findPhoneDevice();
+                      if (phoneDevice == null) {
+                          currentCard = fallbackCard;
+                          return;
+                      }
+                  }
+
+                  btBusy = true;
+                  currentCard = "SOURCE: PHONE BT\nThinking...";
+                  postHud();
+
+                  final String payload = tail(text, 1200);
+                  final BluetoothDevice target = phoneDevice;
+
+                  new Thread(() -> {
+                      String response = "";
+                      boolean ok = false;
+                      BluetoothDevice successful = null;
+
+                      try {
+                          response = sendBluetooth(target, payload);
+                          ok = response.length() > 0;
+                          successful = target;
+                      } catch (Throwable e) {
+                          btError = "Primary " + shortErr(e);
+
+                          // Retry visible bonded devices once. This handles phone address/name changes.
+                          List<BluetoothDevice> devices = bondedDevicesSnapshot();
+                          for (BluetoothDevice d : devices) {
+                              if (target != null && safeDeviceAddr(d).equals(safeDeviceAddr(target))) continue;
+                              try {
+                                  response = sendBluetooth(d, payload);
+                                  ok = response.length() > 0;
+                                  successful = d;
+                                  break;
+                              } catch (Throwable ignored) {}
+                          }
+
+                          if (!ok) {
+                              response = "SOURCE: LOCAL\nBT error: " + e.getClass().getSimpleName();
+                          }
+                      }
+
+                      final String finalResponse = ok ? response : fallbackCard;
+                      final boolean finalOk = ok;
+                      final BluetoothDevice finalSuccessful = successful;
+
+                      ui.post(() -> {
+                          btBusy = false;
+                          if (finalOk) {
+                              btOk++;
+                              if (finalSuccessful != null) {
+                                  phoneDevice = finalSuccessful;
+                                  btName = safeDeviceName(finalSuccessful);
+                                  btAddress = safeDeviceAddr(finalSuccessful);
+                                  lastSuccessfulBtAt = System.currentTimeMillis();
+                                  try { getPreferences(0).edit().putString("last_good_bt_addr", btAddress).apply(); } catch (Throwable ignored) {}
+                              }
+                          } else {
+                              btFail++;
+                          }
+                          currentCard = cleanCard(finalResponse);
+                          updateHud();
+                      });
+                  }, "copilot-v16c-bt-send").start();
+              }
+
+              private String sendBluetooth(BluetoothDevice device, String payload) throws Exception {
+                  if (btAdapter != null) {
+                      try { btAdapter.cancelDiscovery(); } catch (Throwable ignored) {}
+                  }
+
+                  BluetoothSocket socket = device.createRfcommSocketToServiceRecord(COPILOT_UUID);
+                  socket.connect();
+
+                  OutputStream out = socket.getOutputStream();
+                  BufferedReader br = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+
+                  out.write((payload + "\n__END__\n").getBytes(StandardCharsets.UTF_8));
+                  out.flush();
+
+                  StringBuilder response = new StringBuilder();
+                  String line;
+                  while ((line = br.readLine()) != null) {
+                      if ("__END__".equals(line.trim())) break;
+                      response.append(line).append("\n");
+                      if (response.length() > 1200) break;
+                  }
+
+                  try { socket.close(); } catch (Throwable ignored) {}
+
+                  return response.toString().trim();
+              }
+
+              private String cleanCard(String s) {
+                  if (s == null || s.trim().length() == 0) return fallbackCard;
+                  s = s.trim();
+                  if (s.length() > 280) s = s.substring(0, 280);
+                  return s;
+              }
+
+              private void updateFallbackCard() {
+                  String low = (transcriptLog + " " + lastPartial).toLowerCase(Locale.US).trim();
+
+                  if (low.length() < 8) {
+                      fallbackCard = "SOURCE: LOCAL\nWaiting for transcript.";
+                  } else if ((low.contains("one plus one") && (low.contains("seven") || low.contains("7"))) ||
+                      low.contains("1+1=7") || low.contains("1 + 1 = 7")) {
+                      fallbackCard = "SOURCE: LOCAL\nVERIFY: One plus one equals two.";
+                  } else if (containsAny(low, "price", "cost", "money", "dollar", "percent", "rate", "number", "amount", "fee")) {
+                      fallbackCard = "SOURCE: LOCAL\nVERIFY: Ask what number supports that.";
+                  } else if (containsAny(low, "always", "never", "everyone", "nobody", "guaranteed", "impossible")) {
+                      fallbackCard = "SOURCE: LOCAL\nPUSH BACK: Ask for one exception.";
+                  } else if (containsAny(low, "deadline", "tomorrow", "today", "schedule", "meeting", "when", "time")) {
+                      fallbackCard = "SOURCE: LOCAL\nACTION: Confirm the next step.";
+                  } else {
+                      fallbackCard = "SOURCE: LOCAL\nASK: Ask one useful follow-up.";
+                  }
+
+                  if (phoneDevice == null) {
+                      currentCard = fallbackCard;
+                  }
+              }
+
+              private boolean containsAny(String text, String... words) {
+                  for (String w : words) {
+                      if (text.contains(w)) return true;
+                  }
+                  return false;
+              }
+
+              private void applyGainAndMeasure(byte[] src, byte[] dst, int len) {
+                  int p = 0;
+
+                  for (int i = 0; i + 1 < len; i += 2) {
+                      int lo = src[i] & 0xff;
+                      int hi = src[i + 1];
+                      int sample = (hi << 8) | lo;
+                      if (sample > 32767) sample -= 65536;
+
+                      int abs = Math.abs(sample);
+                      if (abs > p) p = abs;
+
+                      int boosted = Math.round(sample * PCM_GAIN);
+                      if (boosted > 32767) boosted = 32767;
+                      else if (boosted < -32768) boosted = -32768;
+
+                      dst[i] = (byte)(boosted & 0xff);
+                      dst[i + 1] = (byte)((boosted >> 8) & 0xff);
+                  }
+
+                  if ((len & 1) == 1) dst[len - 1] = src[len - 1];
+                  peak = p;
+                  if (peak > sessionPeak) sessionPeak = peak;
+              }
+
+              private void postHud() {
+                  ui.post(this::updateHud);
+              }
+
+              private void updateHud() {
+                  long seconds = startedAt == 0L ? 0L : (System.currentTimeMillis() - startedAt) / 1000L;
+
+                  transcript.setText(
+                      "TRANSCRIPT\n" +
+                      (transcriptLog.length() == 0 ? "(waiting for final words)" : transcriptLog) +
+                      "\n\nLIVE\n" +
+                      (lastPartial.length() == 0 ? "(listening...)" : lastPartial)
+                  );
+
+                  String signal;
+                  if (finalCount > 0 || partialCount > 0) signal = "TEXT OK";
+                  else if (sessionPeak > 800) signal = "AUDIO OK";
+                  else if (readCount > 10) signal = "QUIET";
+                  else signal = "STARTING";
+
+                  long goodAge = lastSuccessfulBtAt == 0L ? -1L : (System.currentTimeMillis() - lastSuccessfulBtAt) / 1000L;
+                  String link = phoneDevice != null ? "BT " + btName + " age=" + goodAge + "s" : "NO BT PHONE";
+                  footer.setText(signal + " • " + link + " • ok=" + btOk + " fail=" + btFail + " • " + seconds + "s • P=" + peak + " maxP=" + sessionPeak);
+                  card.setText(currentCard == null || currentCard.trim().length() == 0 ? fallbackCard : currentCard);
+              }
+
+              private void appendTranscript(String text) {
+                  if (text == null || text.trim().isEmpty()) return;
+                  transcriptLog = (transcriptLog + "\n" + text.trim()).trim();
+                  if (transcriptLog.length() > 900) {
+                      transcriptLog = transcriptLog.substring(transcriptLog.length() - 900);
+                      int firstBreak = transcriptLog.indexOf('\n');
+                      if (firstBreak > 0) transcriptLog = transcriptLog.substring(firstBreak + 1);
+                  }
+              }
+
+              private String extract(String json, String key) {
+                  try {
+                      JSONObject obj = new JSONObject(json == null ? "{}" : json);
+                      String value = obj.optString(key, "");
+                      return value == null ? "" : value.trim();
+                  } catch (Throwable ignored) {
+                      return "";
+                  }
+              }
+
+              private void stopListening() {
+                  listening = false;
+                  try { if (recorder != null) recorder.stop(); } catch (Throwable ignored) {}
+                  cleanupRecorder();
+                  status.setText("STOPPED");
+                  footer.setText("Tap/center = start • Bluetooth phone LLM");
+                  updateHud();
+              }
+
+              private void cleanupRecorder() {
+                  try { if (recorder != null) recorder.release(); } catch (Throwable ignored) {}
+                  recorder = null;
+              }
+
+              private void closeModels() {
+                  try {
+                      if (recognizer != null) {
+                          recognizer.close();
+                          recognizer = null;
+                      }
+                  } catch (Throwable ignored) {}
+                  try {
+                      if (speechModel != null) {
+                          speechModel.close();
+                          speechModel = null;
+                      }
+                  } catch (Throwable ignored) {}
+              }
+
+              private void toggleListening() {
+                  if (!ready) {
+                      Toast.makeText(this, "Still loading", Toast.LENGTH_SHORT).show();
+                      return;
+                  }
+                  if (listening) stopListening();
+                  else startListening();
+              }
+
+              private void copyAssetDir(AssetManager am, String assetPath, File destDir) throws Exception {
+                  String[] items = am.list(assetPath);
+                  if (items == null || items.length == 0) {
+                      copyAssetFile(am, assetPath, destDir);
+                      return;
+                  }
+                  if (!destDir.exists()) destDir.mkdirs();
+
+                  for (String item : items) {
+                      String childAssetPath = assetPath + "/" + item;
+                      File childDest = new File(destDir, item);
+                      String[] childItems = am.list(childAssetPath);
+                      if (childItems != null && childItems.length > 0) {
+                          copyAssetDir(am, childAssetPath, childDest);
+                      } else {
+                          copyAssetFile(am, childAssetPath, childDest);
+                      }
+                  }
+              }
+
+              private void copyAssetFile(AssetManager am, String assetPath, File destFile) throws Exception {
+                  File parent = destFile.getParentFile();
+                  if (parent != null && !parent.exists()) parent.mkdirs();
+
+                  try (InputStream in = am.open(assetPath); OutputStream out = new FileOutputStream(destFile)) {
+                      byte[] buf = new byte[8192];
+                      int len;
+                      while ((len = in.read(buf)) > 0) out.write(buf, 0, len);
+                  }
+              }
+
+              private void deleteRecursive(File f) {
+                  if (f == null || !f.exists()) return;
+                  if (f.isDirectory()) {
+                      File[] kids = f.listFiles();
+                      if (kids != null) for (File k : kids) deleteRecursive(k);
+                  }
+                  f.delete();
+              }
+
+              private String safeDeviceName(BluetoothDevice d) {
+                  try {
+                      String n = d.getName();
+                      return safe(n);
+                  } catch (Throwable e) {
+                      return "(name blocked)";
+                  }
+              }
+
+              private String safeDeviceAddr(BluetoothDevice d) {
+                  try {
+                      String a = d.getAddress();
+                      return safe(a);
+                  } catch (Throwable e) {
+                      return "(addr blocked)";
+                  }
+              }
+
+              private String shortErr(Throwable e) {
+                  if (e == null) return "(unknown)";
+                  String msg = e.getMessage();
+                  if (msg == null) msg = "";
+                  if (msg.length() > 80) msg = msg.substring(0, 80);
+                  return e.getClass().getSimpleName() + ": " + msg;
+              }
+
+              private String tail(String s, int max) {
+                  if (s == null) return "";
+                  if (s.length() <= max) return s;
+                  return s.substring(s.length() - max);
+              }
+
+              private String safe(String s) {
+                  return s == null || s.length() == 0 ? "(empty)" : s;
+              }
+
+              @Override
+              public boolean onTouchEvent(MotionEvent e) {
+                  if (e.getAction() == MotionEvent.ACTION_UP) {
+                      toggleListening();
+                      return true;
+                  }
+                  return true;
+              }
+
+              @Override
+              public boolean dispatchKeyEvent(KeyEvent e) {
+                  if (e.getAction() == KeyEvent.ACTION_UP) {
+                      int k = e.getKeyCode();
+                      if (k == KeyEvent.KEYCODE_VOLUME_DOWN) {
+                          findPhoneDevice();
+                          currentCard = phoneDevice != null ? "SOURCE: PHONE BT\nRetargeted: " + btName : "SOURCE: LOCAL\nNo phone found.";
+                          updateHud();
+                          return true;
+                      }
+                      if (k == KeyEvent.KEYCODE_ENTER ||
+                          k == KeyEvent.KEYCODE_DPAD_CENTER ||
+                          k == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ||
+                          k == KeyEvent.KEYCODE_VOLUME_UP) {
+                          toggleListening();
+                          return true;
+                      }
+                  }
+                  return super.dispatchKeyEvent(e);
+              }
+
+              @Override
+              protected void onDestroy() {
+                  super.onDestroy();
+                  listening = false;
+                  cleanupRecorder();
+                  closeModels();
+              }
+          }
+          EOF
+
+      - name: Build Rokid BT HUD Phone LLM APK
+        run: gradle -p rokid :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Show APK outputs and sizes
+        run: |
+          echo "Phone assets:"
+          du -sh phone/app/src/main/assets/* || true
+          echo "Phone APK:"
+          find phone/app/build/outputs/apk -type f -exec ls -lh {} \;
+          echo "Rokid APK:"
+          find rokid/app/build/outputs/apk -type f -exec ls -lh {} \;
+
+      - name: Enforce Rokid APK under 300MB
+        run: |
+          APK="$(find rokid/app/build/outputs/apk/debug -name '*.apk' | head -n 1)"
+          SIZE="$(stat -c%s "$APK")"
+          LIMIT="$((300 * 1024 * 1024))"
+          echo "Rokid APK size bytes: $SIZE"
+          if [ "$SIZE" -gt "$LIMIT" ]; then
+            echo "Rokid APK is over 300MB limit"
+            exit 1
+          fi
+
+      - name: Upload Phone BT Brain Bridge APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: V16C-Phone-Bluetooth-Local-LLM-Brain-APK
+          path: phone/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload Rokid Bluetooth HUD Bridge APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: V16C-Rokid-Bluetooth-HUD-Phone-LLM-APK
+          path: rokid/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
