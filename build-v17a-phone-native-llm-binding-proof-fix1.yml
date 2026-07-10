@@ -1,0 +1,762 @@
+name: V17A Phone Native LLM Binding Proof APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+env:
+  LLAMA_CPP_COMMIT: "3e706dd55f56f59126c053c3db9cfc219a0a7074"
+  ANDROID_COMPILE_SDK: "36"
+  ANDROID_BUILD_TOOLS: "36.0.0"
+  ANDROID_NDK_VERSION: "29.0.13113456"
+  ANDROID_CMAKE_VERSION: "3.31.6"
+  MODEL_URL: "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf?download=true"
+
+jobs:
+  build:
+    name: Build V17A Native Binding Phone APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out workflow repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            curl \
+            git \
+            ninja-build \
+            unzip
+
+          # sdkmanager exits after it has consumed the required "yes" responses.
+          # With pipefail enabled, the resulting SIGPIPE from `yes` would otherwise
+          # incorrectly fail the workflow. Preserve the real sdkmanager exit code.
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null
+          LICENSE_STATUS="${PIPESTATUS[1]}"
+          set -o pipefail
+
+          if [ "${LICENSE_STATUS}" -ne 0 ]; then
+            echo "sdkmanager --licenses failed with exit code ${LICENSE_STATUS}"
+            exit "${LICENSE_STATUS}"
+          fi
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-${ANDROID_COMPILE_SDK}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "ndk;${ANDROID_NDK_VERSION}" \
+            "cmake;${ANDROID_CMAKE_VERSION}"
+
+          echo "ANDROID_HOME=${ANDROID_HOME}"
+          java -version
+          "${ANDROID_HOME}/cmake/${ANDROID_CMAKE_VERSION}/bin/cmake" --version
+          ninja --version
+
+      - name: Fetch pinned llama.cpp Android binding
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          rm -rf llama.cpp
+          git init llama.cpp
+          git -C llama.cpp remote add origin https://github.com/ggml-org/llama.cpp.git
+          git -C llama.cpp fetch --depth 1 origin "${LLAMA_CPP_COMMIT}"
+          git -C llama.cpp checkout --detach FETCH_HEAD
+
+          test -f llama.cpp/examples/llama.android/lib/src/main/java/com/arm/aichat/AiChat.kt
+          test -f llama.cpp/examples/llama.android/lib/src/main/java/com/arm/aichat/InferenceEngine.kt
+          test -f llama.cpp/examples/llama.android/gradlew
+
+          echo "Using llama.cpp commit:"
+          git -C llama.cpp rev-parse HEAD
+
+      - name: Configure arm64 native binding
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          PROJECT="llama.cpp/examples/llama.android"
+          LIB_GRADLE="${PROJECT}/lib/build.gradle.kts"
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("llama.cpp/examples/llama.android/lib/build.gradle.kts")
+          text = path.read_text(encoding="utf-8")
+
+          old = 'abiFilters += listOf("arm64-v8a", "x86_64")'
+          new = 'abiFilters += listOf("arm64-v8a")'
+
+          if old not in text:
+              raise SystemExit("Expected llama.android ABI declaration was not found.")
+
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          PY
+
+          grep -n "ndkVersion\|abiFilters\|GGML_CPU_ALL_VARIANTS" "${LIB_GRADLE}"
+
+      - name: Generate V17A phone proof application
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          PROJECT="llama.cpp/examples/llama.android"
+          APP="${PROJECT}/app"
+
+          rm -rf "${APP}/src/main/java/com/example/llama"
+          mkdir -p "${APP}/src/main/java/com/damage/copilot/nativeproof"
+          mkdir -p "${APP}/src/main/res/values"
+          mkdir -p "${APP}/src/main/assets"
+
+          cat > "${APP}/build.gradle.kts" <<'EOF'
+          plugins {
+              alias(libs.plugins.android.application)
+              alias(libs.plugins.jetbrains.kotlin.android)
+          }
+
+          android {
+              namespace = "com.damage.copilot.nativeproof"
+              compileSdk = 36
+
+              defaultConfig {
+                  applicationId = "com.damage.copilot.nativeproof"
+                  minSdk = 33
+                  targetSdk = 36
+
+                  versionCode = 1701
+                  versionName = "17.0a-phone-native-llm-proof"
+
+                  ndk {
+                      abiFilters += listOf("arm64-v8a")
+                  }
+              }
+
+              buildTypes {
+                  debug {
+                      isMinifyEnabled = false
+                      isShrinkResources = false
+                  }
+
+                  release {
+                      isMinifyEnabled = false
+                      isShrinkResources = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlin {
+                  jvmToolchain(17)
+              }
+
+              androidResources {
+                  noCompress += listOf("gguf")
+              }
+
+              packaging {
+                  jniLibs {
+                      useLegacyPackaging = true
+                  }
+                  resources {
+                      excludes += "/META-INF/{AL2.0,LGPL2.1}"
+                  }
+              }
+          }
+
+          dependencies {
+              implementation(libs.bundles.androidx)
+              implementation(libs.material)
+              implementation(project(":lib"))
+          }
+          EOF
+
+          cat > "${APP}/src/main/AndroidManifest.xml" <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+              <application
+                  android:allowBackup="false"
+                  android:extractNativeLibs="true"
+                  android:hardwareAccelerated="true"
+                  android:label="@string/app_name"
+                  android:largeHeap="true"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.NativeProof"
+                  android:usesCleartextTraffic="false">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|uiMode|density"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:screenOrientation="portrait">
+
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > "${APP}/src/main/res/values/strings.xml" <<'EOF'
+          <resources>
+              <string name="app_name">V17A Native LLM Proof</string>
+          </resources>
+          EOF
+
+          cat > "${APP}/src/main/res/values/themes.xml" <<'EOF'
+          <resources>
+              <style name="Theme.NativeProof" parent="Theme.AppCompat.DayNight.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:navigationBarColor">#000000</item>
+                  <item name="android:statusBarColor">#000000</item>
+                  <item name="android:windowBackground">#000000</item>
+                  <item name="android:windowLightNavigationBar">false</item>
+                  <item name="android:windowLightStatusBar">false</item>
+                  <item name="colorAccent">#00FF33</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > "${APP}/src/main/java/com/damage/copilot/nativeproof/MainActivity.kt" <<'EOF'
+          package com.damage.copilot.nativeproof
+
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.os.SystemClock
+          import android.text.method.ScrollingMovementMethod
+          import android.view.Gravity
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.lifecycle.lifecycleScope
+          import com.arm.aichat.AiChat
+          import com.arm.aichat.InferenceEngine
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.Job
+          import kotlinx.coroutines.flow.collect
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.util.Locale
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var statusView: TextView
+              private lateinit var detailsView: TextView
+              private lateinit var outputView: TextView
+              private lateinit var runButton: Button
+
+              private lateinit var engine: InferenceEngine
+              private var generationJob: Job? = null
+              private var modelFile: File? = null
+              private var modelLoadMs: Long = 0L
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+                  buildUi()
+                  initializeNativeEngine()
+              }
+
+              private fun buildUi() {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      setPadding(dp(20), dp(20), dp(20), dp(20))
+                      setBackgroundColor(Color.BLACK)
+                  }
+
+                  root.addView(textView(
+                      text = "V17A PHONE NATIVE LLM PROOF",
+                      sizeSp = 22f,
+                      color = "#00FF33",
+                      bold = true
+                  ))
+
+                  statusView = textView(
+                      text = "STARTING",
+                      sizeSp = 18f,
+                      color = "#FFFFFF",
+                      bold = true
+                  )
+                  root.addView(statusView)
+
+                  detailsView = textView(
+                      text = "Preparing official llama.cpp Android binding...",
+                      sizeSp = 14f,
+                      color = "#B7FFBF",
+                      bold = false
+                  )
+                  root.addView(detailsView)
+
+                  runButton = Button(this).apply {
+                      text = "RUN NATIVE LLM TEST"
+                      isEnabled = false
+                      setOnClickListener { runProof() }
+                  }
+                  root.addView(
+                      runButton,
+                      LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply {
+                          topMargin = dp(14)
+                          bottomMargin = dp(14)
+                      }
+                  )
+
+                  outputView = textView(
+                      text = "SOURCE: PHONE NATIVE LLM\n\nWaiting for model load.",
+                      sizeSp = 17f,
+                      color = "#00FF33",
+                      bold = true
+                  ).apply {
+                      gravity = Gravity.START
+                      movementMethod = ScrollingMovementMethod()
+                      setTextIsSelectable(true)
+                  }
+
+                  val outputScroll = ScrollView(this).apply {
+                      isFillViewport = true
+                      addView(
+                          outputView,
+                          ScrollView.LayoutParams(
+                              ScrollView.LayoutParams.MATCH_PARENT,
+                              ScrollView.LayoutParams.WRAP_CONTENT
+                          )
+                      )
+                  }
+
+                  root.addView(
+                      outputScroll,
+                      LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          0,
+                          1f
+                      )
+                  )
+
+                  root.addView(textView(
+                      text = "No CLI • No ProcessBuilder • No Bluetooth • No cloud • No rule response",
+                      sizeSp = 12f,
+                      color = "#B0B0B0",
+                      bold = false
+                  ))
+
+                  setContentView(root)
+              }
+
+              private fun initializeNativeEngine() {
+                  statusView.text = "COPYING BUNDLED GGUF"
+                  detailsView.text =
+                      "The first launch copies the model from the APK into app-private storage."
+
+                  lifecycleScope.launch {
+                      try {
+                          val copyStarted = SystemClock.elapsedRealtime()
+
+                          val localModel = withContext(Dispatchers.IO) {
+                              ensureBundledModel()
+                          }
+                          modelFile = localModel
+
+                          val copyMs = SystemClock.elapsedRealtime() - copyStarted
+
+                          statusView.text = "LOADING MODEL IN-PROCESS"
+                          detailsView.text =
+                              "Model: ${formatBytes(localModel.length())}\n" +
+                              "Path: ${localModel.absolutePath}\n" +
+                              "Copy/check: ${copyMs} ms"
+
+                          val loadStarted = SystemClock.elapsedRealtime()
+
+                          engine = withContext(Dispatchers.Default) {
+                              AiChat.getInferenceEngine(applicationContext)
+                          }
+
+                          withContext(Dispatchers.IO) {
+                              engine.loadModel(localModel.absolutePath)
+                          }
+
+                          modelLoadMs = SystemClock.elapsedRealtime() - loadStarted
+
+                          statusView.text = "PHONE NATIVE LLM READY"
+                          detailsView.text =
+                              "Binding: AiChat / InferenceEngine\n" +
+                              "Model: ${formatBytes(localModel.length())}\n" +
+                              "Native load: ${modelLoadMs} ms\n" +
+                              "ABI: ${android.os.Build.SUPPORTED_ABIS.joinToString()}"
+
+                          outputView.text =
+                              "SOURCE: PHONE NATIVE LLM\n\n" +
+                              "Model loaded in-process. Tap RUN NATIVE LLM TEST."
+
+                          runButton.isEnabled = true
+                      } catch (error: Throwable) {
+                          showFailure("MODEL INITIALIZATION FAILED", error)
+                      }
+                  }
+              }
+
+              private fun runProof() {
+                  if (!::engine.isInitialized) {
+                      outputView.text =
+                          "SOURCE: PHONE NATIVE LLM\n\nERROR: Native engine is not initialized."
+                      return
+                  }
+
+                  generationJob?.cancel()
+                  runButton.isEnabled = false
+                  statusView.text = "NATIVE INFERENCE RUNNING"
+                  outputView.text =
+                      "SOURCE: PHONE NATIVE LLM\n\nGENERATING..."
+
+                  val generated = StringBuilder()
+                  val started = SystemClock.elapsedRealtime()
+                  var tokenEvents = 0
+
+                  generationJob = lifecycleScope.launch(Dispatchers.Default) {
+                      try {
+                          engine.sendUserPrompt(
+                              message = PROOF_PROMPT,
+                              predictLength = 64
+                          ).collect { token ->
+                              tokenEvents += 1
+                              generated.append(token)
+
+                              val liveText = generated.toString()
+                              withContext(Dispatchers.Main) {
+                                  outputView.text =
+                                      "SOURCE: PHONE NATIVE LLM\n\n" + liveText
+                              }
+                          }
+
+                          val generationMs =
+                              SystemClock.elapsedRealtime() - started
+                          val finalText = generated.toString().trim()
+                          val contentPass = answerCorrectsClaim(finalText)
+
+                          withContext(Dispatchers.Main) {
+                              statusView.text =
+                                  if (contentPass) {
+                                      "NATIVE LLM PROOF PASSED"
+                                  } else {
+                                      "NATIVE TOKENS RECEIVED — REVIEW ANSWER"
+                                  }
+
+                              detailsView.text =
+                                  "Binding: AiChat / InferenceEngine\n" +
+                                  "Model load: ${modelLoadMs} ms\n" +
+                                  "Generation: ${generationMs} ms\n" +
+                                  "Token events: ${tokenEvents}\n" +
+                                  "Content check: ${if (contentPass) "PASS" else "REVIEW"}"
+
+                              outputView.text =
+                                  "SOURCE: PHONE NATIVE LLM\n\n" +
+                                  if (finalText.isBlank()) {
+                                      "(The native flow completed without visible text.)"
+                                  } else {
+                                      finalText
+                                  }
+
+                              runButton.isEnabled = true
+                          }
+                      } catch (error: Throwable) {
+                          withContext(Dispatchers.Main) {
+                              showFailure("NATIVE INFERENCE FAILED", error)
+                          }
+                      }
+                  }
+              }
+
+              private fun ensureBundledModel(): File {
+                  val modelDirectory = File(filesDir, "models")
+                  if (modelDirectory.exists() && !modelDirectory.isDirectory) {
+                      check(modelDirectory.delete()) {
+                          "Could not replace invalid models path."
+                      }
+                  }
+                  if (!modelDirectory.exists()) {
+                      check(modelDirectory.mkdirs()) {
+                          "Could not create model directory."
+                      }
+                  }
+
+                  val destination = File(modelDirectory, MODEL_FILENAME)
+                  val assetLength = try {
+                      assets.openFd(MODEL_ASSET).use { it.length }
+                  } catch (_: Throwable) {
+                      -1L
+                  }
+
+                  val mustCopy =
+                      !destination.exists() ||
+                      destination.length() < MINIMUM_MODEL_BYTES ||
+                      (assetLength > 0L && destination.length() != assetLength)
+
+                  if (mustCopy) {
+                      val temporary = File(modelDirectory, "$MODEL_FILENAME.part")
+                      if (temporary.exists()) {
+                          temporary.delete()
+                      }
+
+                      assets.open(MODEL_ASSET).use { input ->
+                          FileOutputStream(temporary).use { output ->
+                              val buffer = ByteArray(1024 * 1024)
+                              while (true) {
+                                  val count = input.read(buffer)
+                                  if (count < 0) break
+                                  output.write(buffer, 0, count)
+                              }
+                              output.fd.sync()
+                          }
+                      }
+
+                      check(temporary.length() >= MINIMUM_MODEL_BYTES) {
+                          "Bundled GGUF is unexpectedly small: ${temporary.length()} bytes."
+                      }
+
+                      if (destination.exists()) {
+                          check(destination.delete()) {
+                              "Could not replace the existing model."
+                          }
+                      }
+                      check(temporary.renameTo(destination)) {
+                          "Could not move the copied model into place."
+                      }
+                  }
+
+                  check(destination.exists()) {
+                      "Model file does not exist after copy."
+                  }
+                  check(destination.length() >= MINIMUM_MODEL_BYTES) {
+                      "Model file is too small: ${destination.length()} bytes."
+                  }
+
+                  return destination
+              }
+
+              private fun answerCorrectsClaim(answer: String): Boolean {
+                  val normalized = answer
+                      .lowercase(Locale.US)
+                      .replace(Regex("\\s+"), " ")
+                      .trim()
+
+                  val identifiesTwo =
+                      normalized.contains("one plus one equals two") ||
+                      normalized.contains("one plus one is two") ||
+                      normalized.contains("1 + 1 = 2") ||
+                      normalized.contains("1+1=2")
+
+                  val rejectsSeven =
+                      normalized.contains("not seven") ||
+                      normalized.contains("seven is incorrect") ||
+                      normalized.contains("claim is false") ||
+                      normalized.contains("statement is false") ||
+                      normalized.contains("incorrect")
+
+                  return identifiesTwo && rejectsSeven
+              }
+
+              private fun showFailure(title: String, error: Throwable) {
+                  statusView.text = title
+                  detailsView.text =
+                      "${error.javaClass.simpleName}: ${error.message ?: "(no message)"}"
+                  outputView.text =
+                      "SOURCE: PHONE NATIVE LLM\n\n" +
+                      "ERROR: ${error.javaClass.name}\n" +
+                      (error.message ?: "(no message)")
+                  runButton.isEnabled = ::engine.isInitialized
+              }
+
+              private fun textView(
+                  text: String,
+                  sizeSp: Float,
+                  color: String,
+                  bold: Boolean
+              ): TextView =
+                  TextView(this).apply {
+                      this.text = text
+                      textSize = sizeSp
+                      setTextColor(Color.parseColor(color))
+                      gravity = Gravity.CENTER
+                      setPadding(0, dp(7), 0, dp(7))
+                      visibility = View.VISIBLE
+                      if (bold) {
+                          setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+                      }
+                  }
+
+              private fun dp(value: Int): Int =
+                  (value * resources.displayMetrics.density).toInt()
+
+              private fun formatBytes(bytes: Long): String {
+                  val mib = bytes.toDouble() / (1024.0 * 1024.0)
+                  return String.format(Locale.US, "%.1f MiB", mib)
+              }
+
+              override fun onStop() {
+                  generationJob?.cancel()
+                  super.onStop()
+              }
+
+              override fun onDestroy() {
+                  generationJob?.cancel()
+                  if (::engine.isInitialized) {
+                      try {
+                          engine.destroy()
+                      } catch (_: Throwable) {
+                          // The process is already shutting down.
+                      }
+                  }
+                  super.onDestroy()
+              }
+
+              companion object {
+                  private const val MODEL_ASSET = "brain.gguf"
+                  private const val MODEL_FILENAME = "SmolLM2-135M-Instruct-Q4_K_M.gguf"
+                  private const val MINIMUM_MODEL_BYTES = 50L * 1024L * 1024L
+
+                  private const val PROOF_PROMPT =
+                      "Correct the following false arithmetic claim in exactly one short sentence. " +
+                      "Begin with VERIFY:. Do not discuss these instructions. " +
+                      "Claim: One plus one equals seven."
+              }
+          }
+          EOF
+
+          if grep -RInE "ProcessBuilder|Runtime\.getRuntime|llama-cli|llama-server" \
+              "${APP}/src/main/java"; then
+            echo "Forbidden CLI/subprocess code found in V17A."
+            exit 1
+          fi
+
+          echo "V17A generated source files:"
+          find "${APP}/src/main" -maxdepth 8 -type f -print
+
+      - name: Download bundled SmolLM2 GGUF
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          MODEL_PATH="llama.cpp/examples/llama.android/app/src/main/assets/brain.gguf"
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-all-errors \
+            --connect-timeout 30 \
+            --output "${MODEL_PATH}" \
+            "${MODEL_URL}"
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path(
+              "llama.cpp/examples/llama.android/app/src/main/assets/brain.gguf"
+          )
+          size = path.stat().st_size
+
+          if size < 50 * 1024 * 1024:
+              raise SystemExit(f"Downloaded GGUF is too small: {size} bytes")
+
+          with path.open("rb") as handle:
+              magic = handle.read(4)
+
+          if magic != b"GGUF":
+              raise SystemExit(f"Invalid GGUF magic: {magic!r}")
+
+          print(f"Validated GGUF: {size / 1024 / 1024:.1f} MiB")
+          PY
+
+          ls -lh "${MODEL_PATH}"
+
+      - name: Build V17A debug APK
+        working-directory: llama.cpp/examples/llama.android
+        shell: bash
+        env:
+          GRADLE_OPTS: >-
+            -Dorg.gradle.jvmargs=-Xmx6g
+            -Dfile.encoding=UTF-8
+            -Dkotlin.daemon.jvm.options=-Xmx2g
+        run: |
+          set -euxo pipefail
+
+          chmod +x gradlew
+
+          ./gradlew \
+            :app:assembleDebug \
+            --no-daemon \
+            --stacktrace \
+            --warning-mode all
+
+      - name: Verify native APK payload
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          APK="llama.cpp/examples/llama.android/app/build/outputs/apk/debug/app-debug.apk"
+          test -f "${APK}"
+
+          unzip -l "${APK}" > /tmp/v17a-apk-contents.txt
+
+          grep -F "assets/brain.gguf" /tmp/v17a-apk-contents.txt
+          grep -E "lib/arm64-v8a/.+\.so" /tmp/v17a-apk-contents.txt
+
+          if grep -E "lib/x86_64/" /tmp/v17a-apk-contents.txt; then
+            echo "Unexpected x86_64 libraries were packaged."
+            exit 1
+          fi
+
+          cp "${APK}" V17A-Phone-Native-LLM-Proof.apk
+
+          echo "Final APK:"
+          ls -lh V17A-Phone-Native-LLM-Proof.apk
+
+          echo "Packaged native libraries:"
+          grep -E "lib/arm64-v8a/.+\.so" /tmp/v17a-apk-contents.txt | tail -50
+
+      - name: Upload V17A phone APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: V17A-Phone-Native-LLM-Proof-APK
+          path: V17A-Phone-Native-LLM-Proof.apk
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
