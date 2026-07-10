@@ -1,0 +1,26 @@
+Alias name: rokid-release
+Creation date: Jul 10, 2026
+Entry type: PrivateKeyEntry
+Certificate chain length: 1
+Certificate[1]:
+Owner: CN=Kyle Medcalf, OU=Private Android Development, O=UTS, L=Cincinnati, ST=Ohio, C=US
+Issuer: CN=Kyle Medcalf, OU=Private Android Development, O=UTS, L=Cincinnati, ST=Ohio, C=US
+Serial number: 27e94635b4e0d81b
+Valid from: Fri Jul 10 17:11:24 UTC 2026 until: Tue Nov 25 17:11:24 UTC 2053
+Certificate fingerprints:
+	 SHA1: 63:29:4F:04:08:B9:8D:BF:26:E9:90:1F:B5:86:E5:83:3C:4C:0C:21
+	 SHA256: 32:4A:F4:D5:4D:1C:68:3D:DA:1A:DC:09:9A:F9:1C:A7:E5:57:75:BD:FC:6A:CF:1A:5F:59:DD:14:43:81:85:2E
+Signature algorithm name: SHA384withRSA
+Subject Public Key Algorithm: 4096-bit RSA key
+Version: 3
+
+Extensions: 
+
+#1: ObjectId: 2.5.29.14 Criticality=false
+SubjectKeyIdentifier [
+KeyIdentifier [
+0000: 0C 02 00 E0 4B 67 5A D4   EC 3F FD CA DC 2F 04 52  ....KgZ..?.../.R
+0010: 2D 8C AD 1B                                        -...
+]
+]
+
