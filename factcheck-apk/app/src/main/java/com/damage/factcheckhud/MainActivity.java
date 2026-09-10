@@ -2,51 +2,34 @@ package com.damage.factcheckhud;
 
 import android.Manifest;
 import android.app.Activity;
-import android.app.AlertDialog;
-import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.speech.RecognitionListener;
-import android.speech.RecognizerIntent;
-import android.speech.SpeechRecognizer;
-import android.text.InputType;
 import android.view.Gravity;
 import android.view.WindowManager;
-import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
-import android.widget.Toast;
 
-import org.json.JSONArray;
-import org.json.JSONObject;
+import com.rokid.security.glass3.open.sdk.GlassSdk;
+import com.rokid.security.glass3.open.sdk.client.IServiceConnectionCallback;
+import com.rokid.security.system.server.IClientCallback;
+import com.rokid.security.system.server.aichat.listener.AiChatListener;
+import com.rokid.security.system.server.asr.listener.SpeechCallback;
 
-import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.Locale;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
     private static final int MIC_PERMISSION = 41;
-    private static final String PREFS = "factcheck";
-    private static final String KEY_API = "gemini_api_key";
-    private static final String MODEL = "gemini-3.8-flash";
-    private static final String API_URL =
-        "https://generativelanguage.googleapis.com/v1beta/models/" +
-        MODEL + ":generateContent";
+    private static final String CLIENT_ID = "FactCheckHUD";
     private static final int GREEN = Color.rgb(64, 255, 94);
     private static final int DIM_GREEN = Color.rgb(36, 160, 55);
+    private static final long MIC_SCENE_SETTLE_MS = 3200L;
 
     private final Handler main = new Handler(Looper.getMainLooper());
-    private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final StringBuilder aiBuffer = new StringBuilder();
 
     private LinearLayout root;
     private TextView statusView;
@@ -55,10 +38,161 @@ public class MainActivity extends Activity {
     private TextView detailView;
     private TextView footerView;
 
-    private SpeechRecognizer recognizer;
+    private boolean sdkReady = false;
     private boolean sessionActive = false;
     private boolean checking = false;
     private long sessionToken = 0L;
+
+    private final IClientCallback clientCallback = new IClientCallback.Stub() {
+        @Override
+        public void onReady() {
+            main.post(() -> {
+                sdkReady = true;
+                if (!sessionActive) {
+                    showReady();
+                }
+            });
+        }
+    };
+
+    private final IServiceConnectionCallback sdkConnectionCallback =
+        new IServiceConnectionCallback() {
+            @Override
+            public void onServiceConnected() {
+                try {
+                    GlassSdk.registerClient(CLIENT_ID, clientCallback);
+                } catch (Throwable error) {
+                    showSdkError("Rokid client registration failed: " + safeMessage(error));
+                }
+            }
+
+            @Override
+            public void onServiceDisconnected() {
+                sdkReady = false;
+                showSdkError("Rokid system service disconnected.");
+            }
+
+            @Override
+            public void onBindingDied() {
+                sdkReady = false;
+                showSdkError("Rokid system service binding died. Tap to retry.");
+            }
+        };
+
+    private final SpeechCallback speechCallback = new SpeechCallback.Stub() {
+        @Override
+        public void onStart() {
+            main.post(() -> {
+                if (sessionActive && !checking) {
+                    statusView.setText("● LISTENING");
+                    footerView.setText("ROKID ASR • TAP TO PAUSE");
+                }
+            });
+        }
+
+        @Override
+        public void onIntermediateVad(String content) {
+            main.post(() -> {
+                if (!sessionActive || checking) {
+                    return;
+                }
+                String clean = cleanText(content);
+                if (!clean.isEmpty()) {
+                    statusView.setText("● HEARING CLAIM");
+                    transcriptView.setText("“" + clean + "”");
+                }
+            });
+        }
+
+        @Override
+        public void onAsrComplete(String content) {
+            main.post(() -> handleFinalSpeech(content));
+        }
+
+        @Override
+        public void onError(int code) {
+            main.post(() -> {
+                if (!sessionActive || checking) {
+                    return;
+                }
+                statusView.setText("● ASR RETRY");
+                detailView.setText("Rokid ASR error " + code + ". Retrying…");
+                scheduleAsrRestart(900L);
+            });
+        }
+
+        @Override
+        public void onServiceConnectState(boolean connect) {
+            main.post(() -> {
+                if (!sessionActive || checking) {
+                    return;
+                }
+                if (connect) {
+                    statusView.setText("● ROKID ASR CONNECTED");
+                } else {
+                    statusView.setText("● ASR OFFLINE");
+                    detailView.setText("Rokid speech service is not connected.");
+                }
+            });
+        }
+
+        @Override
+        public void onAsrCompleteWithIntent(String content, int intent, String intentJson) {
+            main.post(() -> handleFinalSpeech(content));
+        }
+    };
+
+    private final AiChatListener aiChatListener = new AiChatListener.Stub() {
+        @Override
+        public void onContinuousModeUpdate(
+            boolean continuousMode,
+            long timeout,
+            boolean keepSessionActive
+        ) {
+            // FactCheck HUD controls its own continuous ASR loop.
+        }
+
+        @Override
+        public void onAiChatAnswer(
+            String answer,
+            boolean isFinish,
+            String contentType,
+            String sessionId
+        ) {
+            main.post(() -> {
+                if (!sessionActive || !checking) {
+                    return;
+                }
+
+                appendAiChunk(answer);
+                if (isFinish) {
+                    finishFactCheck(aiBuffer.toString());
+                }
+            });
+        }
+
+        @Override
+        public void onError(int code, String message) {
+            main.post(() -> {
+                if (!sessionActive) {
+                    return;
+                }
+                checking = false;
+                statusView.setText("● ROKID AI ERROR");
+                verdictView.setText("[?] UNVERIFIED");
+                detailView.setText(
+                    "Rokid AI error " + code + ": " + compact(cleanText(message), 100)
+                );
+                footerView.setText("RETRYING LISTENING…");
+                scheduleAsrRestart(1400L);
+            });
+        }
+
+        @Override
+        public void onAiTakePhoto(String filePath) {
+            // This app never requests camera/vision actions.
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -68,26 +202,16 @@ public class MainActivity extends Activity {
         getWindow().setNavigationBarColor(Color.BLACK);
 
         buildHud();
-
         root.setOnClickListener(v -> {
-            if (apiKey().isEmpty()) {
-                showApiKeyDialog();
-            } else if (sessionActive) {
+            if (sessionActive) {
                 stopSession();
             } else {
                 ensurePermissionAndStart();
             }
         });
-        root.setOnLongClickListener(v -> {
-            showApiKeyDialog();
-            return true;
-        });
 
-        if (apiKey().isEmpty()) {
-            showNeedsKey();
-        } else {
-            showReady();
-        }
+        showConnecting();
+        initRokidSdk();
     }
 
     private void buildHud() {
@@ -100,10 +224,10 @@ public class MainActivity extends Activity {
         TextView title = text("FACTCHECK HUD", 19, true, Gravity.CENTER);
         root.addView(title, params(-1, -2, 0f, 0));
 
-        statusView = text("● READY", 14, true, Gravity.CENTER);
+        statusView = text("● CONNECTING", 14, true, Gravity.CENTER);
         root.addView(statusView, params(-1, -2, 0f, 8));
 
-        transcriptView = text("Tap to begin.", 16, false, Gravity.START);
+        transcriptView = text("Connecting to Rokid services…", 16, false, Gravity.START);
         transcriptView.setMinLines(4);
         root.addView(transcriptView, params(-1, 0, 1f, 18));
 
@@ -115,7 +239,7 @@ public class MainActivity extends Activity {
         detailView.setMinLines(2);
         root.addView(detailView, params(-1, -2, 0f, 8));
 
-        footerView = text("TAP TO START • HOLD FOR SETUP", 11, false, Gravity.CENTER);
+        footerView = text("ROKID NATIVE AI", 11, false, Gravity.CENTER);
         footerView.setTextColor(DIM_GREEN);
         root.addView(footerView, params(-1, -2, 0f, 8));
 
@@ -149,86 +273,51 @@ public class MainActivity extends Activity {
         return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
-    private String apiKey() {
-        return getSharedPreferences(PREFS, MODE_PRIVATE)
-            .getString(KEY_API, "")
-            .trim();
+    private void initRokidSdk() {
+        try {
+            if (GlassSdk.isReady()) {
+                GlassSdk.registerClient(CLIENT_ID, clientCallback);
+            } else {
+                GlassSdk.bindSecurityService(getApplicationContext(), sdkConnectionCallback);
+            }
+        } catch (Throwable error) {
+            showSdkError("Rokid SDK initialization failed: " + safeMessage(error));
+        }
     }
 
-    private void showNeedsKey() {
-        statusView.setText("● SETUP REQUIRED");
-        transcriptView.setText(
-            "Native APK port is installed.\n\n" +
-            "Tap to enter a Gemini API key for fact-checking."
-        );
-        verdictView.setText("[?] API KEY NEEDED");
-        detailView.setText("The key is stored only in this app's private preferences.");
-        footerView.setText("TAP FOR KEY • HOLD TO CHANGE LATER");
+    private void showConnecting() {
+        statusView.setText("● CONNECTING");
+        transcriptView.setText("Connecting to Rokid ASR + AI Chat…");
+        verdictView.setText("");
+        detailView.setText("No external API key is used.");
+        footerView.setText("ROKID NATIVE AI");
     }
 
     private void showReady() {
         statusView.setText("● READY");
-        transcriptView.setText("Tap once to begin listening for factual claims.");
+        transcriptView.setText("Tap once to listen for a factual claim.");
         verdictView.setText("");
-        detailView.setText("");
-        footerView.setText("TAP TO START • HOLD FOR SETUP");
+        detailView.setText("Rokid ASR → Rokid AI Chat");
+        footerView.setText("TAP TO START");
     }
 
-    private void showApiKeyDialog() {
-        final EditText input = new EditText(this);
-        input.setSingleLine(true);
-        input.setHint("Gemini API key");
-        input.setTextColor(Color.WHITE);
-        input.setHintTextColor(Color.GRAY);
-        input.setInputType(
-            InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD
-        );
-
-        String existing = apiKey();
-        if (!existing.isEmpty()) {
-            input.setText(existing);
-            input.setSelection(existing.length());
-        }
-
-        AlertDialog dialog = new AlertDialog.Builder(this)
-            .setTitle("FactCheck HUD setup")
-            .setMessage("Enter the Gemini API key used for live fact-checking.")
-            .setView(input)
-            .setNegativeButton("Cancel", null)
-            .setNeutralButton("Clear", null)
-            .setPositiveButton("Save", null)
-            .create();
-
-        dialog.setOnShowListener(ignored -> {
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
-                String key = input.getText().toString().trim();
-                if (key.isEmpty()) {
-                    Toast.makeText(this, "Enter an API key.", Toast.LENGTH_SHORT).show();
-                    return;
-                }
-                getSharedPreferences(PREFS, MODE_PRIVATE)
-                    .edit()
-                    .putString(KEY_API, key)
-                    .apply();
-                dialog.dismiss();
-                showReady();
-            });
-
-            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> {
-                stopSession();
-                getSharedPreferences(PREFS, MODE_PRIVATE)
-                    .edit()
-                    .remove(KEY_API)
-                    .apply();
-                dialog.dismiss();
-                showNeedsKey();
-            });
+    private void showSdkError(String message) {
+        main.post(() -> {
+            statusView.setText("● ROKID SDK UNAVAILABLE");
+            transcriptView.setText("Could not connect to the built-in Rokid service.");
+            verdictView.setText("[?] ROKID SERVICE");
+            detailView.setText(compact(message, 130));
+            footerView.setText("TAP TO RETRY");
         });
-
-        dialog.show();
     }
 
     private void ensurePermissionAndStart() {
+        if (!sdkReady) {
+            showConnecting();
+            initRokidSdk();
+            return;
+        }
+
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
             == PackageManager.PERMISSION_GRANTED) {
             startSession();
@@ -262,31 +351,48 @@ public class MainActivity extends Activity {
     }
 
     private void startSession() {
-        if (apiKey().isEmpty()) {
-            showNeedsKey();
-            return;
-        }
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            statusView.setText("● SPEECH SERVICE MISSING");
-            transcriptView.setText(
-                "Android did not expose a speech-recognition service on this device."
-            );
-            verdictView.setText("[?] UNAVAILABLE");
-            detailView.setText("This build needs a Rokid-specific speech fallback.");
-            footerView.setText("TAP TO RETRY • HOLD FOR SETUP");
+        try {
+            if (GlassSdk.getGlassAsrService() == null) {
+                showSdkError("Rokid ASR service is not exposed on this firmware.");
+                return;
+            }
+            if (GlassSdk.getGlassAiChatService() == null) {
+                showSdkError("Rokid AI Chat service is not exposed on this firmware.");
+                return;
+            }
+        } catch (Throwable error) {
+            showSdkError(safeMessage(error));
             return;
         }
 
         sessionToken++;
         sessionActive = true;
         checking = false;
+        aiBuffer.setLength(0);
 
-        if (recognizer == null) {
-            recognizer = SpeechRecognizer.createSpeechRecognizer(this);
-            recognizer.setRecognitionListener(new HudRecognitionListener());
+        statusView.setText("● SETTING MIC");
+        transcriptView.setText("Preparing Rokid omnidirectional conversation microphone…");
+        verdictView.setText("");
+        detailView.setText("Listening will begin automatically.");
+        footerView.setText("TAP TO PAUSE");
+
+        try {
+            if (GlassSdk.getGlassDeviceService() != null) {
+                GlassSdk.getGlassDeviceService().switchMicScene(3);
+            }
+            GlassSdk.getGlassAiChatService().startAiChat(false);
+        } catch (Throwable error) {
+            showSdkError("Could not start Rokid voice/AI service: " + safeMessage(error));
+            sessionActive = false;
+            return;
         }
 
-        startRecognizer();
+        final long token = sessionToken;
+        main.postDelayed(() -> {
+            if (sessionActive && !checking && token == sessionToken) {
+                startRokidAsr();
+            }
+        }, MIC_SCENE_SETTLE_MS);
     }
 
     private void stopSession() {
@@ -295,369 +401,238 @@ public class MainActivity extends Activity {
         checking = false;
         main.removeCallbacksAndMessages(null);
 
-        if (recognizer != null) {
-            try {
-                recognizer.cancel();
-            } catch (Throwable ignored) {
+        try {
+            if (GlassSdk.getGlassAsrService() != null) {
+                GlassSdk.getGlassAsrService().stopSpeech();
             }
+        } catch (Throwable ignored) {
+        }
+        try {
+            if (GlassSdk.getGlassAiChatService() != null) {
+                GlassSdk.getGlassAiChatService().endAiChat();
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            if (GlassSdk.getGlassDeviceService() != null) {
+                GlassSdk.getGlassDeviceService().switchMicScene(0);
+            }
+        } catch (Throwable ignored) {
         }
 
         statusView.setText("● PAUSED");
+        transcriptView.setText("Fact checking is paused.");
         verdictView.setText("");
-        detailView.setText("");
-        footerView.setText("TAP TO RESUME • HOLD FOR SETUP");
+        detailView.setText("Rokid microphone scene restored to wearer-focused mode.");
+        footerView.setText("TAP TO RESUME");
     }
 
-    private void startRecognizer() {
-        if (!sessionActive || checking || recognizer == null) {
+    private void startRokidAsr() {
+        if (!sessionActive || checking) {
             return;
         }
 
-        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
-        intent.putExtra(
-            RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-            RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
-        );
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.US.toLanguageTag());
-        intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
-        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
-
-        statusView.setText("● LISTENING");
-        transcriptView.setText("Waiting for a factual claim…");
-        verdictView.setText("");
-        detailView.setText("");
-        footerView.setText("TAP TO PAUSE • HOLD FOR SETUP");
-
         try {
-            recognizer.startListening(intent);
+            if (GlassSdk.getGlassAsrService() == null) {
+                showSdkError("Rokid ASR service became unavailable.");
+                return;
+            }
+
+            GlassSdk.getGlassAsrService().stopSpeech();
+            statusView.setText("● CONNECTING ASR");
+            transcriptView.setText("Waiting for a factual claim…");
+            verdictView.setText("");
+            detailView.setText("");
+            footerView.setText("ROKID ASR • TAP TO PAUSE");
+            GlassSdk.getGlassAsrService().startSpeech(speechCallback);
+        } catch (SecurityException error) {
+            statusView.setText("● ROKID AUTH REQUIRED");
+            verdictView.setText("[?] ASR AUTH");
+            detailView.setText("Check the Rokid/Lingmou account and system authorization.");
+            footerView.setText("TAP TO PAUSE");
         } catch (Throwable error) {
-            showRecognizerError(error.getMessage());
-            scheduleRestart(900L);
+            statusView.setText("● ASR ERROR");
+            detailView.setText(compact(safeMessage(error), 120));
+            scheduleAsrRestart(1000L);
         }
     }
 
-    private void scheduleRestart(long delayMs) {
+    private void scheduleAsrRestart(long delayMs) {
         final long token = sessionToken;
         main.postDelayed(() -> {
             if (sessionActive && !checking && token == sessionToken) {
-                startRecognizer();
+                startRokidAsr();
             }
         }, delayMs);
     }
 
-    private void checkClaim(String claim) {
-        if (claim == null || claim.trim().isEmpty()) {
-            scheduleRestart(350L);
+    private void handleFinalSpeech(String content) {
+        if (!sessionActive || checking) {
+            return;
+        }
+
+        String claim = cleanText(content);
+        if (claim.isEmpty()) {
+            scheduleAsrRestart(350L);
             return;
         }
 
         checking = true;
-        final long token = sessionToken;
-        final String cleanClaim = claim.trim();
+        try {
+            if (GlassSdk.getGlassAsrService() != null) {
+                GlassSdk.getGlassAsrService().stopSpeech();
+            }
+        } catch (Throwable ignored) {
+        }
+        checkClaim(claim);
+    }
 
+    private void checkClaim(String claim) {
+        aiBuffer.setLength(0);
         statusView.setText("● CHECKING");
-        transcriptView.setText("“" + cleanClaim + "”");
+        transcriptView.setText("“" + claim + "”");
         verdictView.setText("…");
-        detailView.setText("Checking current sources with Google Search…");
+        detailView.setText("Checking with Rokid AI…");
         footerView.setText("TAP TO PAUSE");
 
-        worker.execute(() -> {
-            try {
-                String raw = callGemini(cleanClaim);
-                Verdict result = parseVerdict(raw);
-
-                main.post(() -> {
-                    if (!sessionActive || token != sessionToken) {
-                        return;
-                    }
-
-                    statusView.setText("● RESULT");
-                    transcriptView.setText("“" + cleanClaim + "”");
-                    verdictView.setText(result.displayVerdict());
-                    detailView.setText(result.explanation);
-                    footerView.setText("RESUMING LISTENING…");
-
-                    main.postDelayed(() -> {
-                        if (sessionActive && token == sessionToken) {
-                            checking = false;
-                            startRecognizer();
-                        }
-                    }, 2200L);
-                });
-            } catch (Throwable error) {
-                main.post(() -> {
-                    if (!sessionActive || token != sessionToken) {
-                        return;
-                    }
-
-                    checking = false;
-                    statusView.setText("● CHECK FAILED");
-                    verdictView.setText("[?] UNVERIFIED");
-                    detailView.setText(compact(
-                        error.getMessage() == null
-                            ? error.getClass().getSimpleName()
-                            : error.getMessage(),
-                        150
-                    ));
-                    footerView.setText("RETRYING…");
-                    scheduleRestart(1200L);
-                });
-            }
-        });
-    }
-
-    private String callGemini(String claim) throws Exception {
         String prompt =
-            "Fact-check this spoken claim: \"" + claim + "\". " +
-            "Use Google Search whenever it can improve accuracy or freshness. " +
-            "Return exactly one line with two pipe-separated fields: " +
-            "STATUS|brief explanation. STATUS must be VERIFIED, CONTRADICTED, " +
-            "or UNVERIFIED. VERIFIED means supported by reliable evidence; " +
-            "CONTRADICTED means reliable evidence shows it is false; " +
-            "UNVERIFIED means evidence is insufficient, ambiguous, opinion, " +
-            "prediction, or not a checkable factual claim. Keep the explanation " +
-            "under 14 words and do not use the | character in it.";
+            "You are a concise live fact checker. Fact-check this spoken claim: \"" +
+            claim +
+            "\". Use current information and online capabilities available to you when " +
+            "needed. Return exactly one line: STATUS|brief explanation. STATUS must be " +
+            "VERIFIED, CONTRADICTED, or UNVERIFIED. VERIFIED means reliable evidence " +
+            "supports the claim. CONTRADICTED means reliable evidence shows it is false. " +
+            "UNVERIFIED means evidence is insufficient, ambiguous, opinion, prediction, " +
+            "or not a checkable factual claim. Keep the explanation under 14 words and " +
+            "do not use another | character.";
 
-        JSONObject payload = new JSONObject()
-            .put("contents", new JSONArray().put(
-                new JSONObject().put("parts", new JSONArray().put(
-                    new JSONObject().put("text", prompt)
-                ))
-            ))
-            .put("tools", new JSONArray().put(
-                new JSONObject().put("google_search", new JSONObject())
-            ))
-            .put("generationConfig", new JSONObject()
-                .put("temperature", 0.1)
-                .put("maxOutputTokens", 120)
-                .put("thinkingConfig", new JSONObject().put("thinkingLevel", "low"))
-            );
-
-        HttpURLConnection connection =
-            (HttpURLConnection) new URL(API_URL).openConnection();
-        connection.setRequestMethod("POST");
-        connection.setConnectTimeout(15_000);
-        connection.setReadTimeout(60_000);
-        connection.setDoOutput(true);
-        connection.setRequestProperty("Content-Type", "application/json");
-        connection.setRequestProperty("x-goog-api-key", apiKey());
-
-        byte[] request =
-            payload.toString().getBytes(StandardCharsets.UTF_8);
-        connection.setFixedLengthStreamingMode(request.length);
-        connection.getOutputStream().write(request);
-
-        int code = connection.getResponseCode();
-        InputStream stream = code >= 200 && code < 300
-            ? connection.getInputStream()
-            : connection.getErrorStream();
-        String body = readFully(stream);
-        connection.disconnect();
-
-        if (code < 200 || code >= 300) {
-            throw new IllegalStateException(
-                "Gemini HTTP " + code + ": " + compact(body, 170)
-            );
-        }
-
-        JSONObject root = new JSONObject(body);
-        JSONArray candidates = root.optJSONArray("candidates");
-        if (candidates == null || candidates.length() == 0) {
-            throw new IllegalStateException("Gemini returned no result.");
-        }
-
-        JSONObject content =
-            candidates.getJSONObject(0).optJSONObject("content");
-        if (content == null) {
-            throw new IllegalStateException("Gemini response had no content.");
-        }
-
-        JSONArray parts = content.optJSONArray("parts");
-        if (parts == null) {
-            throw new IllegalStateException("Gemini response had no text.");
-        }
-
-        StringBuilder answer = new StringBuilder();
-        for (int i = 0; i < parts.length(); i++) {
-            String piece = parts.getJSONObject(i).optString("text", "");
-            if (!piece.isEmpty()) {
-                if (answer.length() > 0) {
-                    answer.append(' ');
-                }
-                answer.append(piece);
+        try {
+            if (GlassSdk.getGlassAiChatService() == null) {
+                throw new IllegalStateException("Rokid AI Chat service unavailable");
             }
+            GlassSdk.getGlassAiChatService().toAiChat(prompt, aiChatListener);
+        } catch (Throwable error) {
+            checking = false;
+            statusView.setText("● ROKID AI ERROR");
+            verdictView.setText("[?] UNVERIFIED");
+            detailView.setText(compact(safeMessage(error), 120));
+            footerView.setText("RETRYING LISTENING…");
+            scheduleAsrRestart(1400L);
         }
-
-        if (answer.length() == 0) {
-            throw new IllegalStateException("Gemini returned an empty result.");
-        }
-
-        return answer.toString().trim();
     }
 
-    private String readFully(InputStream stream) throws Exception {
-        if (stream == null) {
-            return "";
+    private void appendAiChunk(String answer) {
+        String chunk = answer == null ? "" : answer;
+        if (chunk.isEmpty()) {
+            return;
         }
 
-        try (InputStream input = stream;
-             ByteArrayOutputStream output = new ByteArrayOutputStream()) {
-            byte[] buffer = new byte[8192];
-            int count;
-            while ((count = input.read(buffer)) >= 0) {
-                output.write(buffer, 0, count);
-            }
-            return output.toString(StandardCharsets.UTF_8.name());
+        String current = aiBuffer.toString();
+        if (chunk.startsWith(current) && chunk.length() >= current.length()) {
+            aiBuffer.setLength(0);
+            aiBuffer.append(chunk);
+        } else {
+            aiBuffer.append(chunk);
         }
+    }
+
+    private void finishFactCheck(String raw) {
+        Verdict result = parseVerdict(raw);
+        statusView.setText("● RESULT");
+        verdictView.setText(result.displayVerdict());
+        detailView.setText(result.explanation);
+        footerView.setText("RESUMING ROKID ASR…");
+
+        final long token = sessionToken;
+        main.postDelayed(() -> {
+            if (sessionActive && token == sessionToken) {
+                checking = false;
+                startRokidAsr();
+            }
+        }, 2200L);
     }
 
     private Verdict parseVerdict(String raw) {
-        String cleaned = raw
-            .replace('\n', ' ')
-            .replace('\r', ' ')
+        String cleaned = cleanText(raw)
             .replace("```", "")
+            .replace("**", "")
             .trim();
 
-        String[] fields = cleaned.split("\\|", 2);
-        if (fields.length < 2) {
-            return new Verdict("UNVERIFIED", compact(cleaned, 110));
-        }
-
-        String status = fields[0].trim().toUpperCase(Locale.US);
-        if (!status.equals("VERIFIED")
-            && !status.equals("CONTRADICTED")
-            && !status.equals("UNVERIFIED")) {
+        String upper = cleaned.toUpperCase(Locale.US);
+        String status = "UNVERIFIED";
+        if (upper.contains("CONTRADICTED")) {
+            status = "CONTRADICTED";
+        } else if (upper.contains("VERIFIED")) {
+            status = "VERIFIED";
+        } else if (upper.contains("UNVERIFIED")) {
             status = "UNVERIFIED";
         }
 
-        return new Verdict(status, compact(fields[1], 120));
+        String explanation = cleaned;
+        int pipe = cleaned.indexOf('|');
+        if (pipe >= 0 && pipe + 1 < cleaned.length()) {
+            explanation = cleaned.substring(pipe + 1).trim();
+        }
+        explanation = compact(explanation, 100);
+        if (explanation.isEmpty()) {
+            explanation = "Rokid AI did not provide enough evidence.";
+        }
+
+        return new Verdict(status, explanation);
     }
 
-    private String compact(String text, int maxLength) {
-        if (text == null) {
+    private String cleanText(String value) {
+        if (value == null) {
             return "";
         }
-
-        String normalized = text.replaceAll("\\s+", " ").trim();
-        if (normalized.length() <= maxLength) {
-            return normalized;
-        }
-
-        return normalized.substring(0, Math.max(0, maxLength - 1)) + "…";
+        return value.replaceAll("\\s+", " ").trim();
     }
 
-    private void showRecognizerError(String message) {
-        statusView.setText("● SPEECH ERROR");
-        verdictView.setText("[?] UNVERIFIED");
-        detailView.setText(compact(
-            message == null ? "Speech recognition failed." : message,
-            140
-        ));
-        footerView.setText("RETRYING…");
+    private String compact(String value, int max) {
+        String clean = cleanText(value);
+        if (clean.length() <= max) {
+            return clean;
+        }
+        return clean.substring(0, Math.max(0, max - 1)).trim() + "…";
+    }
+
+    private String safeMessage(Throwable error) {
+        if (error == null) {
+            return "Unknown error";
+        }
+        String message = error.getMessage();
+        return message == null || message.trim().isEmpty()
+            ? error.getClass().getSimpleName()
+            : message.trim();
     }
 
     @Override
     protected void onPause() {
+        super.onPause();
         if (sessionActive) {
             stopSession();
         }
-        super.onPause();
     }
 
     @Override
     protected void onDestroy() {
-        sessionActive = false;
-        sessionToken++;
-        main.removeCallbacksAndMessages(null);
-
-        if (recognizer != null) {
-            try {
-                recognizer.destroy();
-            } catch (Throwable ignored) {
+        try {
+            if (GlassSdk.getGlassAsrService() != null) {
+                GlassSdk.getGlassAsrService().stopSpeech();
             }
-            recognizer = null;
+        } catch (Throwable ignored) {
         }
-
-        worker.shutdownNow();
+        try {
+            if (GlassSdk.getGlassAiChatService() != null) {
+                GlassSdk.getGlassAiChatService().endAiChat();
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            GlassSdk.release();
+        } catch (Throwable ignored) {
+        }
         super.onDestroy();
-    }
-
-    private final class HudRecognitionListener implements RecognitionListener {
-        @Override
-        public void onReadyForSpeech(Bundle params) {
-            statusView.setText("● LISTENING");
-        }
-
-        @Override
-        public void onBeginningOfSpeech() {
-            statusView.setText("● HEARING CLAIM");
-        }
-
-        @Override
-        public void onRmsChanged(float rmsdB) {
-        }
-
-        @Override
-        public void onBufferReceived(byte[] buffer) {
-        }
-
-        @Override
-        public void onEndOfSpeech() {
-            statusView.setText("● PROCESSING SPEECH");
-        }
-
-        @Override
-        public void onError(int error) {
-            if (!sessionActive || checking) {
-                return;
-            }
-
-            if (error == SpeechRecognizer.ERROR_NO_MATCH
-                || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
-                scheduleRestart(350L);
-                return;
-            }
-
-            showRecognizerError("Speech recognizer error " + error);
-            scheduleRestart(900L);
-        }
-
-        @Override
-        public void onResults(Bundle results) {
-            if (!sessionActive || checking) {
-                return;
-            }
-
-            ArrayList<String> matches =
-                results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
-
-            if (matches == null || matches.isEmpty()) {
-                scheduleRestart(350L);
-                return;
-            }
-
-            checkClaim(matches.get(0));
-        }
-
-        @Override
-        public void onPartialResults(Bundle partialResults) {
-            if (!sessionActive || checking) {
-                return;
-            }
-
-            ArrayList<String> matches =
-                partialResults.getStringArrayList(
-                    SpeechRecognizer.RESULTS_RECOGNITION
-                );
-
-            if (matches != null && !matches.isEmpty()) {
-                transcriptView.setText(matches.get(0));
-            }
-        }
-
-        @Override
-        public void onEvent(int eventType, Bundle params) {
-        }
     }
 
     private static final class Verdict {
