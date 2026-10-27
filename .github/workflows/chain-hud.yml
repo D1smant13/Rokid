@@ -1,0 +1,38 @@
+name: Build Torn Chain HUD APK
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "chain-hud/**"
+      - ".github/workflows/chain-hud.yml"
+  pull_request:
+    paths:
+      - "chain-hud/**"
+      - ".github/workflows/chain-hud.yml"
+
+permissions:
+  contents: read
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - name: Install Android 35
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+      - name: Unit tests and APK
+        run: gradle -p chain-hud --no-daemon testDebugUnitTest assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: torn-chain-hud-debug-apk
+          path: chain-hud/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 21
