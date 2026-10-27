@@ -10,6 +10,12 @@ class ChainClockTest {
         assertEquals(156, s.remainingSeconds(11_000L))
         assertEquals(0, s.remainingSeconds(170_000L))
     }
+    @Test fun normalCountdownUsesOnlyTwoLines() {
+        val normal = ChainClock.render(ChainSnapshot(23914, 245, 1_000L), 1_000L)
+        assertEquals("CHAIN 23914", normal.chain)
+        assertEquals("04:05", normal.timer)
+        assertEquals("", normal.detail)
+    }
     @Test fun warnsAtThreshold() {
         val s = ChainSnapshot(123, 29, 10_000L)
         assertTrue(ChainClock.render(s, 10_000L).detail.contains("RISK"))

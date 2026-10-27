@@ -63,3 +63,9 @@ The app uses only the saved faction ID and local Torn API key, and sends request
 ## v0.2 — 403 diagnostic and retry fix
 
 Adds an explicit User-Agent because Torn's API docs warn Cloudflare may block default User-Agents. Reads a small HTTP error body fragment to distinguish Torn API error codes, Cloudflare/security HTML pages, or generic HTTP 403; never echoes the raw response or API key. Plain 403 does not disable the collector: it backs off for 60 seconds and retries. Update in place to keep the encrypted key. If it still shows 403, share the **exact message and optional Cloudflare Ray**, not your key. Try switching between Wi-Fi and mobile data.
+
+## v0.3 — smaller top-right HUD
+
+Hardware feedback confirmed that v0.2 successfully refreshes both chain count and timer without flicker but the layout appeared at **top-left**. This release changes **only presentation**: sets explicit RelativeLayout child parent-end/top alignment (including the protocol's unusual `layout_aliginParentEnd` spelling), reduces the chain label from 16sp to 12sp and timer from 31sp to 21sp, and removes the ordinary "NEXT HIT" subtitle. Special warnings under 60 seconds, and inactive/stale/error messages still appear in the small subtitle when relevant. Torn polling, session logic, API key storage, and incremental display refresh are unchanged.
+
+After installing, **STOP HUD** and **START GLASSES HUD** so a fresh CustomView is opened with the new layout. Merely opening the new app while the previous foreground service owns the view may leave the old view visible. Observe whether the top-right alignment works on the physical waveguide and whether normal updates stay flicker-free.

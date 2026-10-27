@@ -25,7 +25,7 @@ object ChainClock {
             remaining <= 15 -> if ((now / 500L) % 2L == 0L) "!! HIT NOW !!" else "HIT NOW"
             remaining <= 30 -> "!! CHAIN RISK !!"
             remaining <= 60 -> "! UNDER 1 MIN !"
-            else -> "NEXT HIT"
+            else -> ""
         }
         return HudText("CHAIN ${snapshot.count}", timer, warning)
     }
