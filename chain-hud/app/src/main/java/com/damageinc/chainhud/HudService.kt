@@ -40,17 +40,18 @@ class HudService : Service() {
     private var lastNoticeMs = 0L
     private var lastError: String? = null
     private var pausedForKey = false
+    private var nextPollAllowedAt = 0L
     private var lastKeyToken: String? = null
 
     private val ticker = object : Runnable {
         override fun run() {
             if (!enabled) return
             val now = SystemClock.elapsedRealtime()
-            val text = ChainClock.render(current, now, lastError)
+            val text = ChainClock.render(current, now, if (lastError != null) "API ISSUE: SEE PHONE" else null)
             updateDisplay(text, now)
             val remaining = current?.remainingSeconds(now) ?: 600
             val cadence = if (remaining <= 75) 10_000L else 20_000L
-            if (!pausedForKey && !fetching.get() && now - lastPollMs >= cadence) {
+            if (!pausedForKey && !fetching.get() && now >= nextPollAllowedAt && now - lastPollMs >= cadence) {
                 fetchTorn(now)
             }
             if (now - lastNoticeMs >= 10_000L) {
@@ -95,6 +96,7 @@ class HudService : Service() {
             ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
         enabled = true
         pausedForKey = false
+        nextPollAllowedAt = 0L
         current = null
         lastPollMs = 0
         lastError = null
@@ -270,17 +272,39 @@ class HudService : Service() {
                     c.requestMethod = "GET"
                     c.setRequestProperty("Authorization", "ApiKey $key")
                     c.setRequestProperty("Accept", "application/json")
-                    if (c.responseCode != 200) {
-                        if (c.responseCode == 401 || c.responseCode == 403) pausedForKey = true
-                        throw IllegalStateException("Torn HTTP ${c.responseCode}")
+                    // Torn notes Cloudflare may block default HTTP library User-Agents.
+                    c.setRequestProperty("User-Agent", "DamageInc-RokidChainHUD/0.2 (Android; Torn API reader)")
+                    c.instanceFollowRedirects = false
+                    val httpStatus = c.responseCode
+                    if (httpStatus != 200) {
+                        val errorSample = c.errorStream?.bufferedReader()?.use { reader ->
+                            val chars = CharArray(2048)
+                            val length = reader.read(chars)
+                            if (length > 0) String(chars, 0, length) else ""
+                        } ?: ""
+                        val report = HttpErrorDiagnostics.describe(
+                            httpStatus, errorSample, c.contentType,
+                            c.getHeaderField("Server"), c.getHeaderField("CF-Ray")
+                        )
+                        if (httpStatus == 403 || httpStatus == 429) {
+                            nextPollAllowedAt = SystemClock.elapsedRealtime() + 60_000L
+                        } else if (httpStatus >= 500) {
+                            nextPollAllowedAt = SystemClock.elapsedRealtime() + 30_000L
+                        }
+                        if (report.tornCode in listOf(2, 10, 13, 16, 18)) pausedForKey = true
+                        // A plain HTTP 403 does not mean that the key is invalid.
+                        throw IllegalStateException(report.message)
                     }
                     val body = c.inputStream.bufferedReader().use { it.readText() }
                     val j = JSONObject(body)
                     if (j.has("error")) {
                         val err = j.getJSONObject("error")
                         val code = err.optInt("code", 0)
-                        if (code == 2 || code == 10 || code == 16) pausedForKey = true
-                        throw IllegalStateException("Torn API error $code")
+                        if (code in listOf(2, 10, 13, 16, 18)) pausedForKey = true
+                        val explanation = HttpErrorDiagnostics.describe(
+                            200, body, "application/json", null, null
+                        ).message
+                        throw IllegalStateException(explanation)
                     }
                     val chain = j.getJSONObject("chain")
                     val count = chain.getInt("current")

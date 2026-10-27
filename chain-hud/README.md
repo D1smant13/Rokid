@@ -59,3 +59,7 @@ The app uses only the saved faction ID and local Torn API key, and sends request
 7. Another Rokid app/AI trigger: observe whether the HUD survives, pauses, or disappears.
 8. Network disconnect >45s: timer becomes STALE and does not give a false deadline.
 9. Revoked key: stop retrying and ask for a valid one; no infinite invalid-key request loops.
+
+## v0.2 — 403 diagnostic and retry fix
+
+Adds an explicit User-Agent because Torn's API docs warn Cloudflare may block default User-Agents. Reads a small HTTP error body fragment to distinguish Torn API error codes, Cloudflare/security HTML pages, or generic HTTP 403; never echoes the raw response or API key. Plain 403 does not disable the collector: it backs off for 60 seconds and retries. Update in place to keep the encrypted key. If it still shows 403, share the **exact message and optional Cloudflare Ray**, not your key. Try switching between Wi-Fi and mobile data.
